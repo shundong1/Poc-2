@@ -1,0 +1,22 @@
+{
+  "name": "poc-miro-gpt-server",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "dev": "node index.js",
+    "ingest": "node ./rag/ingest.js"
+  },
+  "dependencies": {
+    "@chroma-core/default-embed": "^0.1.9",
+    "chromadb": "^3.3.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.19.2",
+    "mammoth": "^1.11.0",
+    "openai": "^4.57.0",
+    "pdf-parse": "^2.4.5",
+    "pdfjs-dist": "^5.4.624",
+    "unpdf": "^1.4.0"
+  }
+}
