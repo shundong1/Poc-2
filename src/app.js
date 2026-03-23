@@ -2,94 +2,94 @@
 import "./assets/style.css";
 import { QUESTION_BANK } from "./questions.js";
 
-/**
- * PoC3 - Explicit selector + human-in-the-loop + backend Toolboard GPT (Plan A)
- * - Panel: select Tool + Question (explicit)
- * - Read current Tool context from Anchor Frame
- * - Call backend /api/suggest (server injects Toolboard GPT instructions)
- * - Render 2-3 suggestions
- * - User accepts one -> insert sticky into Anchor Frame with stable placement + auto layout
- */
+// ✅ 注册 icon:click，让 App 图标出现在 Miro 工具栏
+miro.board.ui.on("icon:click", async () => {
+  await miro.board.ui.openPanel({ url: "/app.html" });
+});
 
-// ---------- Config: layout inside Frame ----------
-const STICKY_W = 220; // 贴纸近似宽度（用于排版估算）
-const STICKY_H = 140; // 贴纸近似高度（用于排版估算）
-const PADDING = 40; // Frame 内边距
-const GAP_X = 30; // 横向间距
-const GAP_Y = 30; // 纵向间距
-
-// Backend URL
+// ---------- Config ----------
 const BACKEND_URL = "http://localhost:8787";
-
-// 每个 Tool 记录已插入数量，用于排版 index
-const insertedCountByTool = new Map(); // toolId -> count
 
 // ---------- UI ----------
 function ensureUI() {
-  if (document.getElementById("poc2-root")) return;
+  if (document.getElementById("tb-root")) return;
 
   const root = document.createElement("div");
-  root.id = "poc2-root";
-  root.style.padding = "12px";
-  root.style.fontFamily = "Arial, sans-serif";
+  root.id = "tb-root";
+  root.style.cssText = "padding:12px; font-family:Arial,sans-serif;";
 
   root.innerHTML = `
-    <h3 style="margin:0 0 8px 0;">PoC3（Toolboard GPT 后端接入）</h3>
+    <h3 style="margin:0 0 8px 0;font-size:14px;">🧠 Toolboard GPT</h3>
 
-    <div style="font-size:12px;color:#666;margin-bottom:10px; line-height:1.4;">
-      说明：请在白板上为每个 Tool 创建一个 Frame 锚点（Anchor），并命名为题库里的 <b>anchorFrameTitle</b>。<br/>
-      生成建议时系统会读取该 Frame 内的便签/文本作为上下文；采纳后贴纸会稳定插入到该 Frame 内部。
+    <!-- Tool selector -->
+    <div style="margin-bottom:6px;">
+      <div style="font-size:11px;color:#666;margin-bottom:2px;">Tool</div>
+      <select id="toolSelect" style="width:100%;padding:4px;font-size:12px;"></select>
     </div>
 
-    <div style="display:flex; gap:8px; margin-bottom:10px;">
-      <div style="flex:1;">
-        <div style="font-size:12px; color:#666; margin-bottom:4px;">Tool</div>
-        <select id="toolSelect" style="width:100%; padding:6px;"></select>
-      </div>
-      <div style="flex:2;">
-        <div style="font-size:12px; color:#666; margin-bottom:4px;">
-          Focus / Question（选择你希望系统按哪个维度帮助）
-        </div>
-        <select id="qSelect" style="width:100%; padding:6px;"></select>
-      </div>
+    <!-- Question selector -->
+    <div style="margin-bottom:8px;">
+      <div style="font-size:11px;color:#666;margin-bottom:2px;">Focus Question</div>
+      <select id="qSelect" style="width:100%;padding:4px;font-size:12px;"></select>
     </div>
 
-    <div style="display:flex; gap:8px; margin-bottom:10px;">
-      <button id="btnSuggest" style="padding:8px 10px; cursor:pointer;">
-        生成建议（Backend）
+    <!-- Buttons -->
+    <div style="display:flex;gap:6px;margin-bottom:6px;">
+      <button id="btnAnalyse" style="
+        flex:1;padding:7px;cursor:pointer;
+        background:#4262ff;color:#fff;
+        border:none;border-radius:8px;font-size:13px;
+      ">
+        ✨ Analyse
       </button>
-      <button id="btnResetLayout" style="padding:8px 10px; cursor:pointer;">
-        重置排版计数
+      <button id="btnPreview" style="
+        padding:7px;cursor:pointer;
+        background:#f0f0f0;border:none;
+        border-radius:8px;font-size:11px;
+      ">
+        📋 Preview
       </button>
     </div>
 
-    <div style="border:1px solid #ddd; border-radius:8px; padding:10px;">
-      <div style="display:flex; align-items:center; justify-content:space-between;">
-        <b>Suggestions</b>
-        <span id="status" style="font-size:12px;color:#666;"></span>
-      </div>
+    <!-- Status -->
+    <div id="status" style="font-size:11px;color:#888;margin-bottom:6px;min-height:16px;"></div>
 
-      <div
-        id="suggestions"
-        style="
-          margin-top:8px;
-          max-height:320px;
-          overflow-y:auto;
-          padding-right:6px;
-          border-top:1px dashed #eee;
-          padding-top:8px;
-        "
-      ></div>
+    <!-- Board preview -->
+    <div id="boardPreview" style="display:none;margin-bottom:8px;">
+      <div style="font-size:11px;font-weight:bold;margin-bottom:2px;">Board Preview</div>
+      <pre id="boardPreviewContent" style="
+        font-size:10px;
+        background:#f9f9f9;
+        border:1px solid #eee;
+        border-radius:6px;
+        padding:6px;
+        max-height:120px;
+        overflow-y:auto;
+        white-space:pre-wrap;
+        word-break:break-word;
+      "></pre>
+    </div>
+
+    <!-- Suggestions -->
+    <div style="border:1px solid #ddd;border-radius:8px;padding:8px;">
+      <b style="font-size:12px;">Suggestions</b>
+      <div id="suggestions" style="
+        margin-top:6px;
+        max-height:calc(100vh - 280px);
+        overflow-y:auto;
+        padding-right:4px;
+        padding-bottom:20px;
+      "></div>
     </div>
   `;
 
   document.body.appendChild(root);
 }
 
+// ---------- Populate selectors ----------
 function populateToolOptions() {
   const toolSel = document.getElementById("toolSelect");
   toolSel.innerHTML = "";
-
   for (const tool of QUESTION_BANK) {
     const opt = document.createElement("option");
     opt.value = String(tool.toolId);
@@ -101,228 +101,254 @@ function populateToolOptions() {
 function populateQuestionOptions(toolId) {
   const qSel = document.getElementById("qSelect");
   qSel.innerHTML = "";
-
   const tool = QUESTION_BANK.find((t) => t.toolId === toolId);
-  const questions = tool?.questions ?? [];
-
-  for (const q of questions) {
+  for (const q of tool?.questions ?? []) {
     const opt = document.createElement("option");
     opt.value = q.qId;
-    opt.textContent = q.label.length > 90 ? q.label.slice(0, 90) + "…" : q.label;
+    opt.textContent = q.label.length > 80 ? q.label.slice(0, 80) + "…" : q.label;
     opt.title = q.label;
     qSel.appendChild(opt);
   }
 }
 
-function getSelectedToolAndQuestion() {
-  const toolId = Number(document.getElementById("toolSelect").value);
-  const qId = document.getElementById("qSelect").value;
+// ---------- Read board ----------
 
-  const tool = QUESTION_BANK.find((t) => t.toolId === toolId) ?? null;
-  const q = tool?.questions.find((qq) => qq.qId === qId) ?? null;
+// Read sticky notes inside a specific frame using parentId
+async function readFrameContent(frameTitle) {
+  const frames = await miro.board.get({ type: "frame" });
+  const frame = frames.find((f) => f.title === frameTitle);
+  if (!frame) return null;
 
-  return { toolId, tool, qId, q };
+  const items = await miro.board.get({ type: ["sticky_note", "text"] });
+
+  // Filter by parentId instead of coordinates
+  const inside = items.filter((it) => it.parentId === frame.id);
+
+  return inside
+    .map((it) => {
+      const raw = (it.content || it.text || "").toString().trim();
+      const clean = raw.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").trim();
+      return clean;
+    })
+    .filter(Boolean);
+}
+
+// Read ALL tools from the entire board
+async function readFullBoard() {
+  const results = [];
+  for (const tool of QUESTION_BANK) {
+    const toolResult = {
+      toolId: tool.toolId,
+      toolName: tool.toolName,
+      toolDescription: tool.toolDescription,
+      questions: [],
+    };
+
+    for (const q of tool.questions) {
+      const notes = await readFrameContent(q.anchorFrameTitle);
+      toolResult.questions.push({
+        qId: q.qId,
+        label: q.label,
+        anchorFrameTitle: q.anchorFrameTitle,
+        notes: notes ?? [],
+        found: notes !== null,
+      });
+    }
+
+    results.push(toolResult);
+  }
+  return results;
+}
+
+// Format board for preview display
+function formatBoardPreview(boardData) {
+  return boardData
+    .map((tool) => {
+      const qLines = tool.questions
+        .map((q) => {
+          const notesText =
+            q.notes.length > 0
+              ? q.notes.map((n) => `    • ${n}`).join("\n")
+              : "    (empty)";
+          return `  [${q.anchorFrameTitle}]\n${notesText}`;
+        })
+        .join("\n");
+      return `=== ${tool.toolName} ===\n${qLines}`;
+    })
+    .join("\n\n");
 }
 
 // ---------- Backend API ----------
-async function fetchSuggestionsFromBackend(payload) {
+async function fetchSuggestions(payload) {
   const resp = await fetch(`${BACKEND_URL}/api/suggest`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-
-  // backend might return 200 even on fallback; still parse JSON
   const data = await resp.json().catch(() => ({}));
   return data?.suggestions ?? [];
 }
 
-// ---------- Suggestions rendering ----------
-function renderSuggestions(list) {
+// ---------- Render suggestions ----------
+function renderSuggestions(suggestions, targetFrameTitle) {
   const wrap = document.getElementById("suggestions");
   wrap.innerHTML = "";
 
-  if (!list || list.length === 0) {
-    wrap.textContent = "(empty)";
+  if (!suggestions || suggestions.length === 0) {
+    wrap.innerHTML = `<div style="color:#999;font-size:13px;padding:8px 0;">(No suggestions returned)</div>`;
     return;
   }
 
-  const { tool } = getSelectedToolAndQuestion();
-  const toolName = tool?.toolName ?? "Tool";
-
-  for (const s of list) {
+  for (const s of suggestions) {
     const card = document.createElement("div");
-    card.style.border = "1px solid #eee";
-    card.style.borderRadius = "10px";
-    card.style.padding = "10px";
-    card.style.marginBottom = "8px";
+    card.style.cssText = `
+      border:1px solid #eee;
+      border-radius:10px;
+      padding:10px;
+      margin-bottom:8px;
+      background:#fafafa;
+    `;
 
-    const pre = document.createElement("pre");
-    pre.style.whiteSpace = "pre-wrap";
-    pre.style.wordBreak = "break-word";
-    pre.style.margin = "0 0 8px 0";
-    pre.textContent = s.text;
+    const title = document.createElement("div");
+    title.style.cssText = "font-weight:bold;font-size:13px;margin-bottom:6px;color:#333;";
+    title.textContent = s.title || "Suggestion";
+
+    const content = document.createElement("div");
+    content.style.cssText = `
+      font-size:12px;
+      color:#444;
+      margin-bottom:8px;
+      line-height:1.5;
+      white-space:pre-wrap;
+      word-break:break-word;
+    `;
+    content.textContent = s.content || s.text || "";
 
     const btn = document.createElement("button");
-    btn.textContent = `采纳并插入到 ${toolName}（贴纸）`;
-    btn.style.padding = "8px 10px";
-    btn.style.cursor = "pointer";
-
+    btn.textContent = "📌 Insert as Sticky Note";
+    btn.style.cssText = `
+      padding:6px 10px;
+      cursor:pointer;
+      background:#4262ff;
+      color:#fff;
+      border:none;
+      border-radius:6px;
+      font-size:12px;
+    `;
     btn.addEventListener("click", async () => {
-      await acceptSuggestionAndInsertSticky(s.text);
+      await insertStickyNote(s.content || s.text || "", targetFrameTitle);
     });
 
-    card.appendChild(pre);
+    card.appendChild(title);
+    card.appendChild(content);
     card.appendChild(btn);
     wrap.appendChild(card);
   }
 }
 
-// ---------- Anchor frame + context ----------
-async function findAnchorFrameByTitle(title) {
-  const frames = await miro.board.get({ type: "frame" });
-  const frame = frames.find((f) => f.title === title);
-  if (!frame) {
-    throw new Error(
-      `未找到锚点 Frame：${title}\n请在白板上创建/重命名 Frame 为该名字。`
-    );
-  }
-  return frame;
-}
-
-async function readCurrentToolTextFromAnchor(anchorTitle) {
-  const frame = await findAnchorFrameByTitle(anchorTitle);
-
-  // 取白板上所有 sticky + text，再用 frame 边界过滤（先跑通最重要）
-  const items = await miro.board.get({ type: ["sticky_note", "text"] });
-
-  const left = frame.x - frame.width / 2;
-  const right = frame.x + frame.width / 2;
-  const top = frame.y - frame.height / 2;
-  const bottom = frame.y + frame.height / 2;
-
-  const inside = items.filter((it) => it.x >= left && it.x <= right && it.y >= top && it.y <= bottom);
-
-  // 把内容拼成可给 AI 的上下文
-  const lines = inside
-    .map((it) => {
-      const t = (it.content || it.text || "").toString().trim();
-      const kind = it.type === "text" ? "TEXT" : "STICKY";
-      return t ? `- [${kind}] ${t}` : null;
-    })
-    .filter(Boolean);
-
-  return lines.join("\n");
-}
-
-// ---------- Placement ----------
-function computePositionInsideFrame(frame, index) {
-  const left = frame.x - frame.width / 2;
-  const top = frame.y - frame.height / 2;
-
-  const usableW = Math.max(0, frame.width - PADDING * 2);
-  const colWidth = STICKY_W + GAP_X;
-
-  const cols = Math.max(1, Math.floor((usableW + GAP_X) / colWidth));
-  const col = index % cols;
-  const row = Math.floor(index / cols);
-
-  const x = left + PADDING + col * colWidth;
-  const y = top + PADDING + row * (STICKY_H + GAP_Y);
-
-  return { x, y };
-}
-
-function nextIndexForTool(toolId) {
-  const current = insertedCountByTool.get(toolId) ?? 0;
-  insertedCountByTool.set(toolId, current + 1);
-  return current;
-}
-
-// ---------- Insert sticky after user accepts ----------
-async function acceptSuggestionAndInsertSticky(text) {
+// ---------- Insert sticky note ----------
+async function insertStickyNote(text, frameTitle) {
   const status = document.getElementById("status");
-  status.textContent = "正在插入贴纸…";
+  status.textContent = "Inserting sticky note…";
 
   try {
-    const { toolId, tool } = getSelectedToolAndQuestion();
-    const anchorTitle = tool?.anchorFrameTitle ?? "TB_TOOL_2_ANCHOR";
+    const frames = await miro.board.get({ type: "frame" });
+    const frame = frames.find((f) => f.title === frameTitle);
 
-    const frame = await findAnchorFrameByTitle(anchorTitle);
-    const idx = nextIndexForTool(toolId);
-    const { x, y } = computePositionInsideFrame(frame, idx);
+    let x = 0;
+    let y = 0;
 
-    const sticky = await miro.board.createStickyNote({
-      content: text,
-      x,
-      y,
-    });
+    if (frame) {
+      const items = await miro.board.get({ type: "sticky_note" });
+      const inside = items.filter((it) => it.parentId === frame.id);
 
+      const col = inside.length % 3;
+      const row = Math.floor(inside.length / 3);
+      x = frame.x - frame.width / 2 + 40 + col * 250;
+      y = frame.y - frame.height / 2 + 40 + row * 150;
+    }
+
+    const sticky = await miro.board.createStickyNote({ content: text, x, y });
     await miro.board.viewport.zoomTo(sticky);
-    status.textContent = `已插入到 ${anchorTitle} ✅`;
+    status.textContent = `✅ Inserted into ${frameTitle}`;
   } catch (e) {
     console.error(e);
-    status.textContent = "插入失败（看 console）";
-    alert(String(e?.message ?? e));
+    status.textContent = "❌ Insert failed (see console)";
   }
 }
 
 // ---------- Bind events ----------
 function bindUI() {
   const toolSel = document.getElementById("toolSelect");
+
+  // Tool change → update questions
   toolSel.addEventListener("change", () => {
     populateQuestionOptions(Number(toolSel.value));
   });
 
-  document.getElementById("btnSuggest").addEventListener("click", async () => {
+  // Preview button
+  document.getElementById("btnPreview").addEventListener("click", async () => {
     const status = document.getElementById("status");
-    status.textContent = "";
+    const preview = document.getElementById("boardPreview");
+    const previewContent = document.getElementById("boardPreviewContent");
+
+    status.textContent = "Reading board…";
+    preview.style.display = "none";
 
     try {
-      status.textContent = "读取上下文…";
-
-      const { toolId, tool, q } = getSelectedToolAndQuestion();
-
-      const toolName = tool?.toolName ?? "Unknown Tool";
-      const questionText = q?.label ?? "Unknown focus";
-      const anchorTitle = tool?.anchorFrameTitle ?? "TB_TOOL_2_ANCHOR";
-
-      const currentToolText = await readCurrentToolTextFromAnchor(anchorTitle);
-
-      status.textContent = "请求后端生成建议…";
-
-      const payload = {
-        toolId,
-        toolName,
-        qId: q?.qId ?? "",
-        questionText,
-        anchorTitle,
-        boardContext: {
-          currentToolText,
-        },
-      };
-
-      const suggestions = await fetchSuggestionsFromBackend(payload);
-
-      // adapt backend schema -> current UI schema
-      const adapted = (suggestions || []).slice(0, 3).map((s, i) => ({
-        id: s?.id || `s${i + 1}`,
-        text: `【${toolName}｜${s?.title || `建议 ${i + 1}`}】\nFocus: ${questionText}\n\n${s?.content || ""}`,
-      }));
-
-      renderSuggestions(adapted);
-      status.textContent = "已生成 ✅";
+      const boardData = await readFullBoard();
+      previewContent.textContent = formatBoardPreview(boardData);
+      preview.style.display = "block";
+      status.textContent = "✅ Board read complete";
     } catch (e) {
       console.error(e);
-      status.textContent = "生成失败（看 console）";
-      document.getElementById("suggestions").textContent = String(e?.message ?? e);
+      status.textContent = "❌ Failed to read board";
     }
   });
 
-  document.getElementById("btnResetLayout").addEventListener("click", () => {
-    const { toolId } = getSelectedToolAndQuestion();
-    insertedCountByTool.set(toolId, 0);
-    document.getElementById("status").textContent = "已重置当前 Tool 的排版计数";
+  // Analyse button
+  document.getElementById("btnAnalyse").addEventListener("click", async () => {
+    const status = document.getElementById("status");
+    status.textContent = "";
+    document.getElementById("suggestions").innerHTML = "";
+
+    try {
+      const toolId = Number(toolSel.value);
+      const qId = document.getElementById("qSelect").value;
+      const tool = QUESTION_BANK.find((t) => t.toolId === toolId);
+      const q = tool?.questions.find((qq) => qq.qId === qId);
+
+      // Step 1: Read entire board
+      status.textContent = "📋 Reading full board…";
+      const fullBoardData = await readFullBoard();
+
+      // Step 2: Send full board + focus question to backend
+      status.textContent = "🧠 Requesting AI suggestions…";
+
+      const payload = {
+        mode: "single",
+        toolId,
+        toolName: tool.toolName,
+        toolDescription: tool.toolDescription,
+        focusQuestion: {
+          qId,
+          label: q?.label ?? "",
+          anchorFrameTitle: q?.anchorFrameTitle ?? "",
+        },
+        // ✅ Always send full board context
+        boardContext: fullBoardData,
+      };
+
+      const suggestions = await fetchSuggestions(payload);
+      renderSuggestions(suggestions, q?.anchorFrameTitle ?? "");
+      status.textContent = `✅ ${suggestions.length} suggestion(s) generated`;
+    } catch (e) {
+      console.error(e);
+      status.textContent = "❌ Analysis failed (see console)";
+      document.getElementById("suggestions").innerHTML = `
+        <pre style="color:red;font-size:11px;">${e?.message ?? e}</pre>
+      `;
+    }
   });
 }
 
