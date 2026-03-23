@@ -1,133 +1,240 @@
+// src/server/index.js
+import dotenv from "dotenv";
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
 import OpenAI from "openai";
+import { retrieveRelevantContext } from "./rag/retriever.js";
 
 dotenv.config();
 
 const app = express();
+const PORT = process.env.PORT || 8787;
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json());
 
-const port = process.env.PORT || 8787;
+// ---------- Tool → Knowledge file mapping ----------
+const TOOL_KNOWLEDGE_FILES = {
+  0: ["Tool0_Instrucciones.docx"],
+  1: ["Tool1_Instrucciones.docx"],
+  2: ["Tool2_Instrucciones.docx"],
+  3: ["Tool3_Instrucciones.docx"],
+  4: ["Tool4_Instrucciones.docx"],
+  5: ["Tool5_Instrucciones.docx"],
+  6: ["Tool6_Instrucciones.docx"],
+  7: ["Tool7_Instrucciones.docx"],
+  8: ["Instrucciones_Excel.docx"],
+  9: ["Tool9_Instrucciones_.docx"],
+};
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+const BACKGROUND_FILES = [
+  "Esquemas_Toolboard.pdf",
+  "Prompt_ToolboardGPT_actualizado.docx",
+  "libro_pdf_viajeemprendedor (1).pdf",
+];
+
+// ---------- Health check ----------
+app.get("/", (req, res) => {
+  res.json({ status: "ok", message: "Toolboard GPT Server running" });
 });
 
-// ✅ 方案A：把你 Toolboard GPT 的 Instructions 原封不动粘贴到这里
-const TOOLBOARD_SYSTEM_PROMPT = `
-Eres un asistente  especializado exclusivamente en la metodología Toolboard para la generación de proyectos de emprendimiento e innovación.
+// ---------- Build full prompt with paired knowledge + stickies ----------
+async function buildFullPrompt(boardContext, focusToolId, focusQuestion) {
+  let promptSections = [];
 
-Tu misión principal es guiar a los usuarios paso a paso en el aprendizaje y aplicación de esta metodología, utilizando únicamente la información contenida en los documentos adjuntos.  
-No debes inventar, extrapolar, ni buscar información fuera de los documentos proporcionados.
+  // For each tool that has content, pair its knowledge + stickies
+  for (const tool of boardContext) {
+    const hasContent = tool.questions.some((q) => q.notes && q.notes.length > 0);
 
-...
+    // Format tool's sticky notes
+    const stickiesText = tool.questions
+      .map((q) => {
+        const notesText =
+          q.notes && q.notes.length > 0
+            ? q.notes.map((n) => `    • ${n}`).join("\n")
+            : "    (empty)";
+        return `  [${q.anchorFrameTitle}] ${q.label}\n${notesText}`;
+      })
+      .join("\n\n");
 
-¿Quieres que te cuente cómo funciona la metodología ToolBoard? ¿En qué Tool estás trabajando o qué parte necesitas completar ahora? ¿Quieres empezar desde el principio o continuar donde lo dejaste?
-
-Aquí le puedes indicar que accediendo al sitio web www.toolboardcanvas.com puede encontrar información acerca de cómo funciona el método. También le puedes indicar que puede adquirir el libro desde ese sitio web. También dile que existen ebooks gratuitos que se pueden descargar si se registra en el sitio web. También le debes indicar que existe una hoja de cálculo para que al final, una vez definido el proyecto, haga los cálculos y genere visuales acerca de la inversión a hacer y su retorno. 
-Dile ahora que si no está muy familiarizado con los temas a tratar se puede descargar los eBooks siguientes: i) diccionario de emprendimiento e innovación con 500 términos, ii) Listado de 101 modelos de negocio tipo, iii) Manual de instrucciones de la hoja de cálculo del plan económico financiero, iv) Archivo de hoja de cálculo financiera y  v.) Resumen de la metodología ToolBoard.
-
-Recuerdale que con el método ToolBoard va a conseguir hacer todo eso. Y que al final de este GPT va a generar un PDF de unas pocas diapositivas con el que explicar en pocos minutos el proyecto a terceros con los que es necesaria la cooperación. 
-Explicale que TOOLBOARD es un método creado por el Profesor Doctor Jaume Teodoro de Tecnocampus (de la Universidad Pompeu Fabra de Barcelona) ,que se ofrece en acceso libre.  Que en el sitio web www.toolboardcanvas.com se documenta esta metodología al detalle. En el sitio web  se ofrecen además servicios de soporte tanto para emprendedores como para educadores. 
-
-Nunca asumas que estás trabajando en la Tool 8 o en el Excel directamente, a menos que lo indiques explícitamente.  
-Si el usuario no ha indicado en qué Tool está, no avanza automáticamente hacia ninguna. Espera su respuesta.  
-Si ya te has desviado, reconduce la conversación preguntando en qué parte quieres empezar o continuar.
-`;
-
-// 强制模型输出 JSON 数组（结构化建议）
-function buildUserPrompt({ toolName, questionText, currentToolText }) {
-  return `
-You will receive:
-- Tool name
-- A focus question
-- The student's current whiteboard notes (context)
-
-Your job:
-- Follow the Toolboard methodology rules from system instructions.
-- Provide 2-3 suggestions.
-- Do NOT make decisions for the student.
-- Do NOT write the final answer.
-- Be concise and actionable.
-- If context is missing or unclear, include 1 clarifying question as part of a suggestion.
-
-Return ONLY valid JSON in this exact schema (no markdown, no extra text):
-[
-  { "id": "s1", "title": "Suggestion 1", "content": "..." },
-  { "id": "s2", "title": "Suggestion 2", "content": "..." }
-]
-
-Tool: ${toolName}
-Focus question: ${questionText}
-
-Current whiteboard context (student notes):
-${currentToolText || "(empty)"}
-`.trim();
-}
-
-// 解析 JSON（容错：去掉可能的 ```json ``` 包裹）
-function safeParseJson(text) {
-  const cleaned = text
-    .replace(/^```(?:json)?/i, "")
-    .replace(/```$/i, "")
-    .trim();
-  return JSON.parse(cleaned);
-}
-
-app.post("/api/suggest", async (req, res) => {
-  try {
-    const { toolName, questionText, boardContext } = req.body || {};
-    const currentToolText = boardContext?.currentToolText || "";
-
-    if (!toolName || !questionText) {
-      return res.status(400).json({ error: "Missing toolName or questionText" });
+    // Retrieve knowledge for this tool
+    const sourceFiles = TOOL_KNOWLEDGE_FILES[tool.toolId] ?? [];
+    let knowledgeText = "";
+    if (sourceFiles.length > 0) {
+      try {
+        const query = `${tool.toolName} ${focusQuestion?.label ?? ""}`;
+        knowledgeText = await retrieveRelevantContext(query, sourceFiles);
+      } catch (err) {
+        console.warn(`RAG failed for Tool ${tool.toolId}:`, err.message);
+      }
     }
 
-    const userPrompt = buildUserPrompt({ toolName, questionText, currentToolText });
+    // Build section for this tool
+    let section = `=== ${tool.toolName} ===\n`;
 
-    // ✅ 推荐：用 Responses API（OpenAI SDK v4）
-    const resp = await openai.responses.create({
-      model: "gpt-4.1-mini", // 你也可以换成更强的模型
-      input: [
-        { role: "system", content: TOOLBOARD_SYSTEM_PROMPT },
-        { role: "user", content: userPrompt }
-      ],
-      temperature: 0.4,
-      max_output_tokens: 500
-    });
+    if (knowledgeText) {
+      section += `\n[Knowledge Base for ${tool.toolName}]\n${knowledgeText}\n`;
+    }
 
-    const text = resp.output_text || "";
-    let suggestions = safeParseJson(text);
+    section += `\n[User's Board Content for ${tool.toolName}]\n${stickiesText}`;
 
-    // 最低限度清洗
-    if (!Array.isArray(suggestions)) suggestions = [];
-    suggestions = suggestions.slice(0, 3).map((s, i) => ({
-      id: s?.id || `s${i + 1}`,
-      title: s?.title || `Suggestion ${i + 1}`,
-      content: s?.content || ""
-    }));
+    // Mark the focus tool
+    if (tool.toolId === focusToolId) {
+      section += `\n\n⭐ This is the CURRENT TOOL the user needs help with.`;
+    }
 
-    return res.json({ suggestions });
+    promptSections.push(section);
+  }
+
+  // Add background knowledge
+  let backgroundText = "";
+  try {
+    const bgQuery = focusQuestion?.label ?? "Toolboard methodology entrepreneurship";
+    backgroundText = await retrieveRelevantContext(bgQuery, BACKGROUND_FILES);
   } catch (err) {
-    console.error(err);
+    console.warn("Background RAG failed:", err.message);
+  }
 
-    // fallback（确保前端不崩）
-    return res.status(200).json({
-      suggestions: [
-        {
-          id: "s1",
-          title: "Suggestion 1",
-          content:
-            "I couldn’t generate structured suggestions this time. Please try again, or add more notes in the current Tool area to provide context."
-        }
+  if (backgroundText) {
+    promptSections.push(
+      `=== Background Knowledge (Toolboard Methodology) ===\n${backgroundText}`
+    );
+  }
+
+  return promptSections.join("\n\n---\n\n");
+}
+
+// ---------- /api/suggest ----------
+app.post("/api/suggest", async (req, res) => {
+  try {
+    const {
+      mode,
+      toolId,
+      toolName,
+      toolDescription,
+      focusQuestion,
+      boardContext,
+    } = req.body;
+
+    // boardContext must be array of all tools
+    const allTools = Array.isArray(boardContext)
+      ? boardContext
+      : boardContext?.questions
+      ? [{ toolId, toolName, questions: boardContext.questions }]
+      : [];
+
+    // Detect language from sticky notes
+    const allNotes = allTools
+      .flatMap((t) => t.questions.flatMap((q) => q.notes ?? []))
+      .filter(Boolean)
+      .join(" ");
+
+    const hasChinese = /[一-鿿]/.test(allNotes);
+    const hasJapanese = /[぀-ヿ]/.test(allNotes);
+    const hasKorean = /[가-힯]/.test(allNotes);
+    const hasArabic = /[؀-ۿ]/.test(allNotes);
+    const hasSpanish = /[áéíóúüñ¿¡]/i.test(allNotes);
+
+    let detectedLanguage = "English";
+    if (hasChinese) detectedLanguage = "Chinese (中文)";
+    else if (hasJapanese) detectedLanguage = "Japanese (日本語)";
+    else if (hasKorean) detectedLanguage = "Korean (한국어)";
+    else if (hasArabic) detectedLanguage = "Arabic (العربية)";
+    else if (hasSpanish) detectedLanguage = "Spanish (Español)";
+
+    console.log(`Detected language: ${detectedLanguage}`);
+
+    // Build full prompt with paired knowledge + stickies per tool
+    const fullContext = await buildFullPrompt(allTools, toolId, focusQuestion);
+
+    // Build system prompt
+    const systemPrompt = `You are an expert Toolboard GPT assistant specialising in entrepreneurship, innovation, and design thinking.
+
+You will receive:
+1. For each Toolboard tool: the methodology knowledge AND the user's sticky note answers — paired together
+2. A focus question that the user needs help with
+
+Your job is to:
+- Understand the user's full journey across all tools
+- Use both the knowledge base AND the user's actual answers to generate suggestions
+- Generate 3 specific, actionable suggestions for the focus question
+
+IMPORTANT - Language detection:
+- Detect the language used in the user's sticky notes
+- Respond in the SAME language as the user's sticky notes
+- If sticky notes are in Chinese, respond entirely in Chinese
+- If sticky notes are in English, respond entirely in English
+- If sticky notes are in another language, respond in that language
+- If mixed languages, use the dominant language
+
+Always respond in JSON format with this exact structure:
+{
+  "suggestions": [
+    { "id": "s1", "title": "...", "content": "..." },
+    { "id": "s2", "title": "...", "content": "..." },
+    { "id": "s3", "title": "...", "content": "..." }
+  ]
+}
+Return only valid JSON. No markdown, no preamble.`;
+
+    // Build user prompt
+    const userPrompt = `Here is the complete Toolboard context — each tool's knowledge paired with the user's answers:
+
+${fullContext}
+
+---
+
+FOCUS: The user needs help with the following question in ${toolName ?? ""}:
+"${focusQuestion?.label ?? ""}"
+(Frame: ${focusQuestion?.anchorFrameTitle ?? ""})
+
+${toolDescription ? `Tool description: ${toolDescription}` : ""}
+
+Based on:
+1. The methodology knowledge for each tool
+2. The user's actual answers across the entire board
+3. The specific focus question above
+
+IMPORTANT: You MUST respond entirely in ${detectedLanguage}. All titles and content must be in ${detectedLanguage}.
+
+Generate 3 concrete, actionable suggestions to help the user answer the focus question.
+Each suggestion should reference the user's existing work and be grounded in Toolboard methodology.`;
+
+    // Call GPT-4o
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
       ],
-      error: "AI_CALL_FAILED"
+      temperature: 0.7,
+      max_tokens: 1500,
     });
+
+    const raw = completion.choices[0]?.message?.content ?? "{}";
+
+    // Parse JSON
+    let parsed;
+    try {
+      const clean = raw.replace(/```json|```/g, "").trim();
+      parsed = JSON.parse(clean);
+    } catch {
+      console.error("Failed to parse GPT response:", raw);
+      parsed = {
+        suggestions: [{ id: "s1", title: "Response", content: raw }],
+      };
+    }
+
+    res.json(parsed);
+  } catch (err) {
+    console.error("Error in /api/suggest:", err);
+    res.status(500).json({ error: err.message, suggestions: [] });
   }
 });
 
-app.listen(port, () => {
-  console.log(`Server running on http://localhost:${port}`);
+// ---------- Start server ----------
+app.listen(PORT, () => {
+  console.log(`✅ Toolboard GPT Server running at http://localhost:${PORT}`);
 });
