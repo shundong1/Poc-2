@@ -1,9 +1,12 @@
 {
-  "name": "poc-miro-gpt",
+  "name": "toolboard-gpt-miro-plugin",
   "version": "0.1.0",
   "license": "MIT",
   "scripts": {
     "start": "vite",
+    "dev:frontend": "vite",
+    "dev:backend": "cd src/server && node index.js",
+    "dev:all": "node scripts/dev-all.js",
     "build": "vite build",
     "serve": "vite preview"
   },

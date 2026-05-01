@@ -1,57 +1,86 @@
-<<<<<<< HEAD
-"# Practic-1_ShundongWang" 
-# Practic-1_ShundongWang
-=======
-## Poc Miro Gpt
+## ToolBoard GPT Miro Plugin
 
-**&nbsp;ℹ&nbsp;Note**:
+Miro plugin integrated with ToolBoard GPT.
 
-- We recommend a Chromium-based web browser for local development with HTTP. \
-  Safari enforces HTTPS; therefore, it doesn't allow localhost through HTTP.
-- For more information, visit our [developer documentation](https://developers.miro.com).
+### Current architecture
 
-### How to start locally
+This repository uses a three-layer structure:
 
-- Run `npm i` to install dependencies.
-- Run `npm start` to start developing. \
-  Your URL should be similar to this example:
- ```
- http://localhost:3000
- ```
-- Paste the URL under **App URL** in your
-  [app settings](https://developers.miro.com/docs/build-your-first-hello-world-app#step-3-configure-your-app-in-miro).
-- Open a board; you should see your app in the app toolbar or in the **Apps**
-  panel.
+- Frontend: root `src/`, running in the Miro panel with Vite on `http://localhost:3000`
+- Backend: `src/server/`, Express API on `http://localhost:8787`
+- RAG: `src/server/rag/`, responsible for ingestion and retrieval with ChromaDB
 
-### How to build the app
+### Source of truth
 
-- Run `npm run build`. \
-  This generates a static output inside [`dist/`](./dist), which you can host on a static hosting
-  service.
+- Active application code lives in the root `src/` directory
+- The legacy duplicate `poc-miro-gpt/` app tree has been removed from the active setup
 
-### Folder structure
+### Project structure
 
-<!-- The following tree structure is just an example -->
-
-```
+```text
 .
-├── src
-│  ├── assets
-│  │  └── style.css
-│  ├── app.js      // The code for the app lives here
-│  └── index.js    // The code for the app entry point lives here
-├── app.html       // The app itself. It's loaded on the board inside the 'appContainer'
-└── index.html     // The app entry point. This is what you specify in the 'App URL' box in the Miro app settings
+|-- src
+|   |-- app.js
+|   |-- index.js
+|   |-- questions.js
+|   |-- assets
+|   `-- server
+|       |-- index.js
+|       |-- knowledge
+|       |-- chroma
+|       `-- rag
+|           |-- ingest.js
+|           `-- retriever.js
+|-- app.html
+|-- index.html
+|-- package.json
+`-- scripts
+    `-- dev-all.js
 ```
 
-### About the app
+### Install dependencies
 
-This sample app provides you with boilerplate setup and configuration that you can further customize to build your own app.
+```bash
+npm install
+npm --prefix src/server install
+```
 
-<!-- describe shortly the purpose of the sample app -->
+### Run everything
 
-Built using [`create-miro-app`](https://www.npmjs.com/package/create-miro-app).
+Use one command from the repository root:
 
-This app uses [Vite](https://vitejs.dev/). \
-If you want to modify the `vite.config.js` configuration, see the [Vite documentation](https://vitejs.dev/guide/).
->>>>>>> d896fee (initial commit)
+```bash
+npm run dev:all
+```
+
+Or on Windows:
+
+```bat
+start.bat
+```
+
+This starts:
+
+- Frontend: `http://localhost:3000`
+- Backend: `http://localhost:8787`
+
+### Run separately
+
+```bash
+# terminal 1
+cd src/server
+node index.js
+
+# terminal 2
+npm start
+```
+
+### Rebuild the knowledge base
+
+The current ingestion flow is manual and performs a full rebuild.
+
+```bash
+npm --prefix src/server run ingest
+```
+
+Chroma persistence lives in `src/server/chroma/`.
