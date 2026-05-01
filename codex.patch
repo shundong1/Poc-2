@@ -1,0 +1,112 @@
+diff --git a/README.md b/README.md
+index c61f13fc7814d77989a2765cfe224c0db45c8779..375db7658f7e3a21d1a98291e50053d6981bd90c 100644
+--- a/README.md
++++ b/README.md
+@@ -1,57 +1,65 @@
+-<<<<<<< HEAD
+-"# Practic-1_ShundongWang" 
+-# Practic-1_ShundongWang
+-=======
+-## Poc Miro Gpt
++## ToolBoard GPT Miro Plugin
+ 
+-**&nbsp;ℹ&nbsp;Note**:
++Miro plugin integrated with ToolBoard GPT.
+ 
+-- We recommend a Chromium-based web browser for local development with HTTP. \
+-  Safari enforces HTTPS; therefore, it doesn't allow localhost through HTTP.
+-- For more information, visit our [developer documentation](https://developers.miro.com).
++### Stack
+ 
+-### How to start locally
++- Frontend: Vanilla JavaScript + HTML + Miro Web SDK v2
++- Backend: Node.js + Express (port `8787`)
++- Vector DB: ChromaDB
++- AI: OpenAI API (`gpt-4o` + `text-embedding-3-small`)
+ 
+-- Run `npm i` to install dependencies.
+-- Run `npm start` to start developing. \
+-  Your URL should be similar to this example:
+- ```
+- http://localhost:3000
+- ```
+-- Paste the URL under **App URL** in your
+-  [app settings](https://developers.miro.com/docs/build-your-first-hello-world-app#step-3-configure-your-app-in-miro).
+-- Open a board; you should see your app in the app toolbar or in the **Apps**
+-  panel.
+-
+-### How to build the app
+-
+-- Run `npm run build`. \
+-  This generates a static output inside [`dist/`](./dist), which you can host on a static hosting
+-  service.
+-
+-### Folder structure
+-
+-<!-- The following tree structure is just an example -->
++### Project structure
+ 
+ ```
+ .
+ ├── src
++│  ├── app.js                 # Frontend panel logic
++│  ├── questions.js           # Tool/question bank + frame anchors
+ │  ├── assets
+-│  │  └── style.css
+-│  ├── app.js      // The code for the app lives here
+-│  └── index.js    // The code for the app entry point lives here
+-├── app.html       // The app itself. It's loaded on the board inside the 'appContainer'
+-└── index.html     // The app entry point. This is what you specify in the 'App URL' box in the Miro app settings
++│  └── server
++│     ├── index.js            # Express + RAG orchestration
++│     ├── knowledge           # Source docs for RAG
++│     ├── chroma              # Chroma persistence path
++│     └── rag
++│        ├── ingest.js        # Full ingest pipeline
++│        └── retriever.js     # Semantic retrieval
++├── app.html
++├── index.html
++└── package.json
+ ```
+ 
+-### About the app
++### Run (one command)
+ 
+-This sample app provides you with boilerplate setup and configuration that you can further customize to build your own app.
++Install dependencies first:
+ 
+-<!-- describe shortly the purpose of the sample app -->
++```bash
++npm install
++npm --prefix src/server install
++```
++
++Start frontend and backend together:
++
++```bash
++npm run dev:all
++```
+ 
+-Built using [`create-miro-app`](https://www.npmjs.com/package/create-miro-app).
++- Frontend: `http://localhost:3000`
++- Backend: `http://localhost:8787`
++
++### Alternative: run separately
++
++```bash
++# terminal 1 (backend)
++cd src/server && node index.js
++
++# terminal 2 (frontend)
++npm start
++```
++
++### Rebuild knowledge base (manual, full rebuild)
++
++```bash
++npm --prefix src/server run ingest
++```
+ 
+-This app uses [Vite](https://vitejs.dev/). \
+-If you want to modify the `vite.config.js` configuration, see the [Vite documentation](https://vitejs.dev/guide/).
+->>>>>>> d896fee (initial commit)
