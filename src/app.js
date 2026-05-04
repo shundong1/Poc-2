@@ -16,6 +16,10 @@ const RAG_STATUS_COLORS = {
   online: "#1d9d57",
   offline: "#9e9e9e",
 };
+const refinedNoteIds = new Set();
+const verifiedNoteIds = new Set();
+const systemGeneratedNoteIds = new Set();
+let showWelcome = true;
 
 function normalizeTitle(value = "") {
   return value.replace(/\s+/g, " ").trim().toLowerCase();
@@ -23,7 +27,64 @@ function normalizeTitle(value = "") {
 
 function extractPlainText(item) {
   const raw = (item.content || item.text || "").toString().trim();
-  return raw.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").trim();
+  return raw
+    .replace(/<[^>]*>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#39;/g, "'")
+    .replace(/&#34;/g, '"')
+    .replace(/&#xff0c;/gi, "，")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) =>
+      String.fromCodePoint(parseInt(hex, 16))
+    )
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isTrivialArtifactText(text) {
+  const normalized = (text || "").trim();
+  if (!normalized) return true;
+
+  const compact = normalized.replace(/\s+/g, "");
+  if (compact.length === 1 && /^[A-Za-z0-9]$/.test(compact)) {
+    return true;
+  }
+
+  if (compact.length <= 2 && /^[0-9O〇零○•·\-–—.,:;()]+$/i.test(compact)) {
+    return true;
+  }
+
+  return false;
+}
+
+function buildMeaningfulNoteDetails(items, frameTitle) {
+  return items
+    .map((item) => ({
+      id: item.id,
+      text: extractPlainText(item),
+      widgetType: item.type || "sticky_note",
+      refinedByAgent: refinedNoteIds.has(item.id),
+      verified: verifiedNoteIds.has(item.id),
+      isSystemGenerated: systemGeneratedNoteIds.has(item.id),
+    }))
+    .filter((entry) => {
+      if (!entry.text) {
+        return false;
+      }
+
+      if (isTrivialArtifactText(entry.text)) {
+        console.log("Ignoring trivial board artifact", {
+          frameTitle,
+          noteId: entry.id,
+          widgetType: entry.widgetType,
+          text: entry.text,
+        });
+        return false;
+      }
+
+      return true;
+    });
 }
 
 function isItemInsideFrame(item, frame) {
@@ -90,9 +151,113 @@ function getOptimizeCardLabel(lang = "EN") {
 }
 
 function getNoIssueLabel(lang = "EN") {
-  if (lang === "ZH") return "No major issue detected.";
+  if (lang === "ZH") return "逻辑严密，建议直接分析。";
   if (lang === "ES") return "No se detecto ningun problema importante.";
   return "No major issue detected.";
+}
+
+function getRefineButtonLabel(lang = "EN") {
+  if (lang === "ZH") return "✨ 一键专业化重构";
+  if (lang === "ES") return "✨ Reescritura profesional";
+  return "✨ Professional rewrite";
+}
+
+function getCardStatusPresentation(analysis) {
+  if (analysis.lang === "ZH") {
+    if (analysis.level === "formal") {
+      return { icon: "✅", text: "逻辑严密，建议直接分析。", color: "#2f6b2f" };
+    }
+    if (analysis.level === "semi-formal") {
+      return { icon: "⚠️", text: "表达尚可，但建议加入更多事实支撑。", color: "#a15c00" };
+    }
+    return {
+      icon: "❌",
+      text: "建议：为了确保后续机会分析和商业洞察的生成质量，建议将该描述提升至更具正式性和信息密度的表达方式。",
+      color: "#c62828",
+    };
+  }
+
+  if (analysis.lang === "ES") {
+    if (analysis.level === "formal") {
+      return {
+        icon: "✅",
+        text: "La logica es solida; puede pasar directamente al analisis.",
+        color: "#2f6b2f",
+      };
+    }
+    if (analysis.level === "semi-formal") {
+      return {
+        icon: "⚠️",
+        text: "La expresion es aceptable, pero conviene sumar mas hechos de apoyo.",
+        color: "#a15c00",
+      };
+    }
+    return {
+      icon: "❌",
+      text: "Sugerencia: conviene profesionalizar esta redaccion antes del siguiente analisis.",
+      color: "#c62828",
+    };
+  }
+
+  if (analysis.level === "formal") {
+    return {
+      icon: "✅",
+      text: "Logic is rigorous. Ready for direct analysis.",
+      color: "#2f6b2f",
+    };
+  }
+  if (analysis.level === "semi-formal") {
+    return {
+      icon: "⚠️",
+      text: "Expression is acceptable, but more factual support is recommended.",
+      color: "#a15c00",
+    };
+  }
+  return {
+    icon: "❌",
+    text: "Suggestion: this card should be rewritten in a more formal and information-dense style before further analysis.",
+    color: "#c62828",
+  };
+}
+
+function createWelcomeIllustration() {
+  const tiles = [
+    { letter: "T", background: "#ef9358" },
+    { letter: "O", background: "#ef7b6e" },
+    { letter: "O", background: "#e78cb2" },
+    { letter: "L", background: "#b6a4ea" },
+    { letter: "B", background: "#86a5e8" },
+    { letter: "O", background: "#90dde5" },
+    { letter: "A", background: "#8de37d" },
+    { letter: "R", background: "#f2dc66" },
+    { letter: "D", background: "#f5f5f5" },
+  ];
+
+  const illustration = createElement("div", {
+    style:
+      "display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;width:min(100%,260px);max-width:260px;margin:0 auto 22px auto;",
+  });
+
+  for (const tile of tiles) {
+    illustration.appendChild(
+      createElement("div", {
+        text: tile.letter,
+        style:
+          `height:74px;border-radius:14px;border:2px solid rgba(100,100,100,0.28);background:${tile.background};display:flex;align-items:center;justify-content:center;font-size:44px;font-weight:800;color:${tile.letter === "D" ? "#8e8e8e" : "#ffffff"};letter-spacing:1px;box-shadow:0 4px 12px rgba(0,0,0,0.06);`,
+      })
+    );
+  }
+
+  return illustration;
+}
+
+function renderWelcomeState() {
+  const welcomeView = document.getElementById("welcomeView");
+  const mainView = document.getElementById("mainView");
+  if (!welcomeView || !mainView) return;
+
+  welcomeView.style.display = showWelcome ? "flex" : "none";
+  mainView.style.display = showWelcome ? "none" : "block";
 }
 
 function ensureUI() {
@@ -101,7 +266,94 @@ function ensureUI() {
   const root = createElement("div", {
     id: "tb-root",
     style:
-      "padding:12px;font-family:Arial,sans-serif;box-sizing:border-box;height:100vh;overflow-y:auto;",
+      "padding:12px;font-family:Arial,sans-serif;box-sizing:border-box;height:100vh;overflow-y:auto;background:linear-gradient(180deg,#ffffff 0%,#f7f9fc 100%);",
+  });
+
+  const welcomeView = createElement("div", {
+    id: "welcomeView",
+    style:
+      "min-height:calc(100vh - 24px);display:flex;flex-direction:column;justify-content:center;padding:18px 0 24px 0;width:100%;",
+  });
+
+  const welcomeCard = createElement("div", {
+    style:
+      "width:100%;max-width:100%;background:#ffffff;border:1px solid #e8edf5;border-radius:24px;padding:24px 20px;box-shadow:0 16px 40px rgba(16,42,67,0.08);box-sizing:border-box;",
+  });
+
+  const welcomeTitle = createElement("h2", {
+    text: "Welcome to Toolboard GPT",
+    style:
+      "margin:0 0 18px 0;font-size:24px;line-height:1.2;text-align:center;color:#102a43;font-weight:800;",
+  });
+
+  const instructionTitle = createElement("div", {
+    text: "How to use:",
+    style: "font-size:13px;font-weight:700;color:#334e68;margin-bottom:10px;",
+  });
+
+  const instructionList = createElement("div", {
+    style: "display:flex;flex-direction:column;gap:10px;margin-bottom:22px;",
+  });
+
+  const instructionItems = [
+    {
+      title: "Select:",
+      text: "Choose a Tool and the specific question you want to work on.",
+    },
+    {
+      title: "Preview:",
+      text: "Use 'Preview' to review the current board content without generating suggestions.",
+    },
+    {
+      title: "Analyse:",
+      text: "Click 'Analyse' to generate suggested answers for the selected question, and insert them as sticky notes if needed.",
+    },
+    {
+      title: "Project Review:",
+      text: "Run Project Review to check project progress, logic gaps, and the next recommended step. It also includes a 'Professional Refinement' feature to improve any sticky note that is not clear or specific enough based on your project context.",
+    },
+  ];
+
+  for (const item of instructionItems) {
+    instructionList.appendChild(
+      createElement("div", {
+        html: `<span style="font-weight:700;color:#102a43;">${item.title}</span> <span style="color:#486581;">${item.text}</span>`,
+        style: "font-size:12px;line-height:1.6;",
+      })
+    );
+  }
+
+  const getStartedButton = createElement("button", {
+    id: "btnGetStarted",
+    text: "Get Started",
+    style:
+      "width:100%;padding:14px 18px;cursor:pointer;background:#4262ff;color:#fff;border:none;border-radius:14px;font-size:15px;font-weight:700;box-shadow:0 12px 24px rgba(66,98,255,0.24);transition:transform 0.18s ease, box-shadow 0.18s ease;",
+  });
+  getStartedButton.addEventListener("mouseenter", () => {
+    getStartedButton.style.transform = "scale(1.03)";
+    getStartedButton.style.boxShadow = "0 16px 28px rgba(66,98,255,0.30)";
+  });
+  getStartedButton.addEventListener("mouseleave", () => {
+    getStartedButton.style.transform = "scale(1)";
+    getStartedButton.style.boxShadow = "0 12px 24px rgba(66,98,255,0.24)";
+  });
+  getStartedButton.addEventListener("click", () => {
+    showWelcome = false;
+    renderWelcomeState();
+  });
+
+  welcomeCard.append(
+    welcomeTitle,
+    createWelcomeIllustration(),
+    instructionTitle,
+    instructionList,
+    getStartedButton
+  );
+  welcomeView.appendChild(welcomeCard);
+
+  const mainView = createElement("div", {
+    id: "mainView",
+    style: "display:none;",
   });
 
   const header = createElement("h3", {
@@ -139,6 +391,8 @@ function ensureUI() {
     style:
       "width:100%;padding:10px 12px;margin-bottom:10px;cursor:pointer;background:#102a43;color:#fff;border:none;border-radius:10px;font-size:13px;font-weight:bold;",
   });
+
+  diagnoseButton.textContent = "Project Review";
 
   const toolBlock = createElement("div", { style: "margin-bottom:6px;" });
   toolBlock.append(
@@ -179,12 +433,6 @@ function ensureUI() {
       text: "Preview",
       style:
         "padding:7px;cursor:pointer;background:#f0f0f0;border:none;border-radius:8px;font-size:11px;",
-    }),
-    createElement("button", {
-      id: "btnAudit",
-      text: "Read Test",
-      style:
-        "padding:7px;cursor:pointer;background:#e8f0fe;border:none;border-radius:8px;font-size:11px;",
     })
   );
 
@@ -202,6 +450,11 @@ function ensureUI() {
       text: "Board Preview",
       style: "font-size:11px;font-weight:bold;margin-bottom:2px;",
     }),
+    createElement("div", {
+      text: "💡 Tip: If some sticky notes are missing here, please ensure they are placed directly inside the corresponding question area. Stickers outside the designated frame boundaries cannot be detected by the system.",
+      style:
+        "font-size:12px;line-height:1.5;color:#666666;margin:8px 0;padding:8px 10px;border:1px solid #d9e8ff;border-radius:10px;background:#f5f9ff;",
+    }),
     createElement("pre", {
       id: "boardPreviewContent",
       style:
@@ -210,6 +463,7 @@ function ensureUI() {
   );
 
   const suggestionSection = createElement("div", {
+    id: "suggestionSection",
     style: "border:1px solid #ddd;border-radius:8px;padding:8px;",
   });
   suggestionSection.append(
@@ -229,7 +483,7 @@ function ensureUI() {
     })
   );
 
-  root.append(
+  mainView.append(
     header,
     systemBar,
     diagnoseButton,
@@ -241,7 +495,9 @@ function ensureUI() {
     suggestionSection
   );
 
+  root.append(welcomeView, mainView);
   document.body.appendChild(root);
+  renderWelcomeState();
 }
 
 function populateToolOptions() {
@@ -311,15 +567,19 @@ function inspectFrameRead(frameTitle, frames, items) {
   const insideButUnparentedItems = items.filter(
     (item) => item.parentId !== frame.id && isItemInsideFrame(item, frame)
   );
-  const selectedItems =
-    parentedItems.length > 0 ? parentedItems : insideButUnparentedItems;
-  const noteDetails = selectedItems
-    .map((item) => ({
-      id: item.id,
-      text: extractPlainText(item),
-      widgetType: item.type || "sticky_note",
-    }))
-    .filter((entry) => entry.text);
+  const parentedNoteDetails = buildMeaningfulNoteDetails(parentedItems, frameTitle);
+  const fallbackNoteDetails = buildMeaningfulNoteDetails(
+    insideButUnparentedItems,
+    frameTitle
+  );
+  const noteDetails =
+    parentedNoteDetails.length > 0 ? parentedNoteDetails : fallbackNoteDetails;
+  const readMode =
+    parentedNoteDetails.length > 0
+      ? "parentId"
+      : fallbackNoteDetails.length > 0
+      ? "geometry-fallback"
+      : "empty";
 
   return {
     notes: noteDetails.map((entry) => entry.text),
@@ -331,7 +591,7 @@ function inspectFrameRead(frameTitle, frames, items) {
     insideButUnparentedCount: insideButUnparentedItems.length,
     similarTitles,
     frameId: frame.id,
-    readMode: parentedItems.length > 0 ? "parentId" : noteDetails.length > 0 ? "geometry-fallback" : "empty",
+    readMode,
   };
 }
 
@@ -446,6 +706,12 @@ function collectMissingFrames(boardData) {
   );
 }
 
+function setSuggestionsVisible(visible) {
+  const suggestionSection = document.getElementById("suggestionSection");
+  if (!suggestionSection) return;
+  suggestionSection.style.display = visible ? "block" : "none";
+}
+
 function hideDiagnosisPanel() {
   const panel = document.getElementById("diagnosisPanel");
   panel.style.display = "none";
@@ -550,9 +816,6 @@ async function applyRefinementToSticky(noteId, rewrittenText) {
     await miro.board.widgets.update({
       id: noteId,
       text: rewrittenText,
-      style: {
-        backgroundColor: "light_green",
-      },
     });
     return;
   }
@@ -564,11 +827,6 @@ async function applyRefinementToSticky(noteId, rewrittenText) {
   }
 
   sticky.content = rewrittenText;
-  if (sticky.style) {
-    sticky.style.fillColor = "light_green";
-  } else {
-    sticky.style = { fillColor: "light_green" };
-  }
 
   if (typeof sticky.sync === "function") {
     await sticky.sync();
@@ -578,16 +836,108 @@ async function applyRefinementToSticky(noteId, rewrittenText) {
   throw new Error("This Miro SDK version does not support sticky updates in the current code path.");
 }
 
-async function handleApplyRefinement(refinementTarget) {
+async function refreshDiagnosisPanel() {
+  const boardData = await readFullBoard();
+  const response = await fetchJson("/api/diagnose", { boardContext: boardData });
+  renderDiagnosis(response);
+  return response;
+}
+
+function buildRefinementContextPayload(analysis) {
+  return {
+    toolId: analysis.toolId ?? null,
+    toolTitle: analysis.toolName || "",
+    questionId: analysis.questionId || analysis.frameTitle || "",
+    questionDescription: analysis.questionDescription || "",
+    methodologyGoal: analysis.methodologyGoal || "",
+    toolSpecificFocus: analysis.toolSpecificFocus || "",
+    frameTitle: analysis.frameTitle || "",
+  };
+}
+
+function extractQuestionNotes(question = {}) {
+  const noteDetails = Array.isArray(question.noteDetails)
+    ? question.noteDetails
+    : (question.notes ?? []).map((text) => ({ text }));
+
+  return noteDetails
+    .map((note) => String(note?.text || "").trim())
+    .filter(Boolean);
+}
+
+function buildCurrentContextPayload(boardData, analysis) {
+  const currentTool = (boardData || []).find((tool) => tool.toolId === analysis.toolId);
+  const toolContext = (currentTool?.questions ?? [])
+    .filter((question) => question.qId !== (analysis.questionId || analysis.frameTitle))
+    .map((question) => ({
+      questionId: question.qId,
+      questionText: question.label || "",
+      notes: extractQuestionNotes(question),
+    }))
+    .filter((entry) => entry.notes.length > 0);
+
+  const projectContext = (boardData || [])
+    .filter(
+      (tool) =>
+        typeof tool.toolId === "number" &&
+        typeof analysis.toolId === "number" &&
+        tool.toolId < analysis.toolId
+    )
+    .flatMap((tool) =>
+      (tool.questions ?? [])
+        .map((question) => ({
+          toolId: tool.toolId,
+          toolName: tool.toolName,
+          questionId: question.qId,
+          questionText: question.label || "",
+          notes: extractQuestionNotes(question),
+        }))
+        .filter((entry) => entry.notes.length > 0)
+    )
+    .slice(-8);
+
+  return {
+    toolContext,
+    projectContext,
+    targetQuestion: {
+      questionId: analysis.questionId || analysis.frameTitle || "",
+      questionText: analysis.questionDescription || "",
+      toolName: analysis.toolName || "",
+    },
+  };
+}
+
+async function applyRefinement(refinementTarget) {
   if (!refinementTarget?.canApply && !refinementTarget?.canOptimize) {
     return;
   }
 
+  const boardData = await readFullBoard();
+  const currentContext = buildCurrentContextPayload(boardData, refinementTarget);
+
+  const refineResponse = await fetchJson("/api/refine", {
+    text: refinementTarget.originalText || refinementTarget.sourceText || "",
+    lang: refinementTarget.lang || "",
+    context: {
+      ...buildRefinementContextPayload(refinementTarget),
+      currentContext,
+    },
+    boardContext: boardData,
+  });
+
   await applyRefinementToSticky(
     refinementTarget.noteId,
-    refinementTarget.rewrittenText || refinementTarget.optimizedText
+    refineResponse.rewrittenText ||
+      refinementTarget.rewrittenText ||
+      refinementTarget.optimizedText
   );
-  setStatus("Optimized text applied to the selected card.", "success");
+  if (refinementTarget.noteId) {
+    refinedNoteIds.add(refinementTarget.noteId);
+    verifiedNoteIds.add(refinementTarget.noteId);
+    systemGeneratedNoteIds.add(refinementTarget.noteId);
+  }
+  await refreshDiagnosisPanel();
+  setStatus("已优化，并已刷新当前审计结果。", "success");
 }
 
 function renderSuggestions(suggestions, targetFrameTitle) {
@@ -692,6 +1042,11 @@ function renderQualityAlert(panel, qualityAlert) {
         text: `Syntactic Complexity: ${metrics.syntacticComplexity ?? "-"}`,
         style:
           "font-size:11px;color:#4a664a;padding:6px 8px;border-radius:8px;background:#ffffff;border:1px solid #d6ead6;",
+      }),
+      createElement("div", {
+        text: `Overall Score: ${metrics.overallScore ?? "-"}`,
+        style:
+          "font-size:11px;color:#4a664a;padding:6px 8px;border-radius:8px;background:#ffffff;border:1px solid #d6ead6;",
       })
     );
     card.appendChild(metricsWrap);
@@ -699,13 +1054,13 @@ function renderQualityAlert(panel, qualityAlert) {
 
   if (qualityAlert.canApply) {
     const applyButton = createElement("button", {
-      text: getApplyLabel(qualityAlert.lang),
+      text: getRefineButtonLabel(qualityAlert.lang),
       style:
         "padding:7px 10px;cursor:pointer;background:#2f8f46;color:#fff;border:none;border-radius:8px;font-size:12px;",
     });
     applyButton.addEventListener("click", async () => {
       try {
-        await handleApplyRefinement(qualityAlert);
+        await applyRefinement(qualityAlert);
       } catch (error) {
         console.error(error);
         setStatus(error?.message || "Failed to apply rewrite.", "error");
@@ -718,37 +1073,40 @@ function renderQualityAlert(panel, qualityAlert) {
 }
 
 function renderCardAnalyses(panel, cardAnalyses = []) {
-  if (!Array.isArray(cardAnalyses) || cardAnalyses.length === 0) {
+  const actionableAnalyses = (Array.isArray(cardAnalyses) ? cardAnalyses : []).filter(
+    (analysis) =>
+      (analysis.scores?.overallScore ?? 0) < 60 &&
+      analysis.isSystemGenerated !== true &&
+      analysis.verified !== true
+  );
+
+  if (actionableAnalyses.length === 0) {
     return;
   }
 
-  panel.appendChild(
-    createElement("div", {
-      text: "Card-by-card writing quality review",
-      style: "font-size:12px;font-weight:bold;color:#7a4b00;margin:12px 0 8px 0;",
-    })
-  );
-
-  for (const analysis of cardAnalyses) {
+  for (const analysis of actionableAnalyses) {
+    const statusPresentation = getCardStatusPresentation(analysis);
     const hasIssue = Array.isArray(analysis.alerts) && analysis.alerts.length > 0;
     const primaryAlert = hasIssue ? analysis.alerts[0] : null;
     const card = createElement("div", {
       style:
-        "border:1px solid #e7dcc0;border-radius:10px;padding:10px;margin-bottom:10px;background:#fffdf7;",
+        "border:1px solid #e57373;border-radius:10px;padding:10px;margin-bottom:10px;background:#fff5f5;",
     });
 
     card.append(
       createElement("div", {
-        text: hasIssue
-          ? `${analysis.cardLabel}: Logic quality alert`
-          : `${analysis.cardLabel}: ${getNoIssueLabel(analysis.lang)}`,
+        text: `${analysis.cardLabel}: ❌ Logic quality alert`,
         style: `font-size:12px;font-weight:bold;margin-bottom:6px;color:${
-          hasIssue ? "#8a4b00" : "#2f6b2f"
+          "#c62828"
         };`,
       }),
       createElement("div", {
         text: `${analysis.toolName} | ${analysis.frameTitle}`,
         style: "font-size:11px;color:#7a6a4d;margin-bottom:8px;word-break:break-word;",
+      }),
+      createElement("div", {
+        text: statusPresentation.text,
+        style: "font-size:12px;line-height:1.6;color:#c62828;margin-bottom:8px;",
       })
     );
 
@@ -768,6 +1126,11 @@ function renderCardAnalyses(panel, cardAnalyses = []) {
       }),
       createElement("div", {
         text: `Syntactic Complexity: ${analysis.scores?.syntacticComplexity ?? "-"}`,
+        style:
+          "font-size:11px;color:#5c4a20;padding:6px 8px;border-radius:8px;background:#fff;border:1px solid #eadfc4;",
+      }),
+      createElement("div", {
+        text: `Overall Score: ${analysis.scores?.overallScore ?? "-"}`,
         style:
           "font-size:11px;color:#5c4a20;padding:6px 8px;border-radius:8px;background:#fff;border:1px solid #eadfc4;",
       })
@@ -815,13 +1178,13 @@ function renderCardAnalyses(panel, cardAnalyses = []) {
 
     if (analysis.canOptimize) {
       const optimizeButton = createElement("button", {
-        text: getOptimizeCardLabel(analysis.lang),
+        text: getRefineButtonLabel(analysis.lang),
         style:
           "padding:7px 10px;cursor:pointer;background:#2f8f46;color:#fff;border:none;border-radius:8px;font-size:12px;",
       });
       optimizeButton.addEventListener("click", async () => {
         try {
-          await handleApplyRefinement(analysis);
+          await applyRefinement(analysis);
         } catch (error) {
           console.error(error);
           setStatus(error?.message || "Failed to optimize this card.", "error");
@@ -941,6 +1304,10 @@ async function insertStickyNote(text, frameTitle) {
     const x = frame.x - frame.width / 2 + 40 + column * 250;
     const y = frame.y - frame.height / 2 + 40 + row * 150;
     const sticky = await miro.board.createStickyNote({ content: text, x, y });
+    if (sticky?.id) {
+      verifiedNoteIds.add(sticky.id);
+      systemGeneratedNoteIds.add(sticky.id);
+    }
     await miro.board.viewport.zoomTo(sticky);
     setStatus(`Inserted into ${frameTitle}`, "success");
   } catch (error) {
@@ -962,6 +1329,7 @@ function bindUI() {
     setStatus("Reading board...", "neutral");
     preview.style.display = "none";
     hideDiagnosisPanel();
+    setSuggestionsVisible(false);
 
     try {
       const boardData = await readFullBoard();
@@ -980,29 +1348,10 @@ function bindUI() {
     }
   });
 
-  document.getElementById("btnAudit").addEventListener("click", async () => {
-    setStatus("Running board read test...", "neutral");
-    document.getElementById("boardPreview").style.display = "none";
-
-    try {
-      const report = await runBoardReadAudit();
-      const flagged = report.filter((entry) => entry.issue !== "ok");
-      renderAuditReport(report);
-      setStatus(
-        flagged.length > 0
-          ? `Read test complete. Found ${flagged.length} potential issue(s).`
-          : "Read test complete. No obvious frame read issues found.",
-        flagged.length > 0 ? "warning" : "success"
-      );
-    } catch (error) {
-      console.error(error);
-      setStatus("Read test failed.", "error");
-    }
-  });
-
   document.getElementById("btnAnalyse").addEventListener("click", async () => {
     setStatus("", "neutral");
     hideDiagnosisPanel();
+    setSuggestionsVisible(true);
     document.getElementById("suggestions").innerHTML = "";
 
     try {
@@ -1055,6 +1404,7 @@ function bindUI() {
 
   document.getElementById("btnDiagnose").addEventListener("click", async () => {
     setStatus("Reading full board for diagnosis...", "neutral");
+    setSuggestionsVisible(true);
     document.getElementById("suggestions").innerHTML = "";
 
     try {
