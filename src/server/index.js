@@ -1,10 +1,24 @@
+﻿import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { createRequire } from "module";
 import dotenv from "dotenv";
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
+import mammoth from "mammoth";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import { retrieveRelevantContext } from "./rag/retriever.js";
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const require = createRequire(import.meta.url);
+const workerPath = require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs");
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+  `file:///${workerPath.replace(/\\/g, "/")}`
+).href;
 
 const app = express();
 const PORT = process.env.PORT || 8787;
@@ -12,10 +26,161 @@ const OPENAI_MAX_RETRIES = Number(process.env.OPENAI_MAX_RETRIES || 3);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
 const RATE_LIMIT_MAX_REQUESTS = Number(process.env.RATE_LIMIT_MAX_REQUESTS || 10);
 const TOTAL_FRAME_COUNT = 41;
+const KNOWLEDGE_DIR = path.join(__dirname, "knowledge");
+const ASSISTANT_MEMORY_PATH = path.join(__dirname, "assistant-memory.json");
+const GLOBAL_ASSISTANT_NAME = "Toolboard Global Methodology Expert";
+const DEFAULT_BOARD_ID = "default-board";
+const GLOBAL_ASSISTANT_SYSTEM_ROLE =
+  "You are a senior advisor who has fully mastered the complete Toolboard methodology.";
+const GLOBAL_ASSISTANT_MODEL = "gpt-4o-mini";
+const LOG_LEVEL = String(
+  process.env.TOOLBOARD_LOG_LEVEL || "info"
+).toLowerCase();
+const LOG_PRIORITY = { error: 0, warn: 1, info: 2, debug: 3 };
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const rateLimitBuckets = new Map();
 const recentGeneratedContentHashes = new Set();
+let methodologyCorpusPromise = null;
+let assistantBootstrapPromise = null;
+const assistantMemoryStore = loadAssistantMemoryStore();
+
+function shouldLog(level = "info") {
+  const currentPriority = LOG_PRIORITY[LOG_LEVEL] ?? LOG_PRIORITY.info;
+  const levelPriority = LOG_PRIORITY[level] ?? LOG_PRIORITY.info;
+  return levelPriority <= currentPriority;
+}
+
+function toPrettyJson(value) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function indentBlock(value = "") {
+  return String(value)
+    .split("\n")
+    .map((line) => `  ${line}`)
+    .join("\n");
+}
+
+function normalizeSectionValue(value, format = "text") {
+  if (value === undefined || value === null || value === "") {
+    return "(empty)";
+  }
+
+  if (format === "json") {
+    return toPrettyJson(value);
+  }
+
+  if (Array.isArray(value)) {
+    return value.length > 0 ? value.join("\n") : "(empty)";
+  }
+
+  if (typeof value === "object") {
+    return toPrettyJson(value);
+  }
+
+  return String(value);
+}
+
+function logStructured(level, title, { sections = [], error = null } = {}) {
+  if (!shouldLog(level)) {
+    return;
+  }
+
+  const blocks = [`[Toolboard GPT] [${level.toUpperCase()}] ${title}`];
+
+  for (const section of sections) {
+    if (!section?.label) continue;
+    const rendered = normalizeSectionValue(
+      section.value,
+      section.format || "text"
+    );
+    blocks.push(`${section.label}:\n${indentBlock(rendered)}`);
+  }
+
+  if (error) {
+    blocks.push(
+      `Error Message:\n${indentBlock(error.message || String(error))}`
+    );
+    if (error.stack) {
+      blocks.push(`Stack Trace:\n${indentBlock(error.stack)}`);
+    }
+  }
+
+  const method =
+    level === "error"
+      ? console.error
+      : level === "warn"
+      ? console.warn
+      : console.log;
+  method(blocks.join("\n\n"));
+}
+
+const logger = {
+  debug(title, options = {}) {
+    logStructured("debug", title, options);
+  },
+  info(title, options = {}) {
+    logStructured("info", title, options);
+  },
+  warn(title, options = {}) {
+    logStructured("warn", title, options);
+  },
+  error(title, options = {}) {
+    logStructured("error", title, options);
+  },
+};
+
+function summarizeChatPayload(payload = {}) {
+  return {
+    model: payload.model,
+    messageCount: Array.isArray(payload.messages) ? payload.messages.length : 0,
+    responseFormat: payload.response_format?.type || null,
+    temperature: payload.temperature ?? null,
+    maxTokens: payload.max_tokens ?? null,
+  };
+}
+
+function summarizeFactsPayload(factsPayload = {}) {
+  return {
+    dominantLanguage: factsPayload.dominantLanguage || "EN",
+    currentTool: factsPayload.currentTool?.toolName || "",
+    targetQuestion: factsPayload.targetQuestion?.label || "",
+    authoritativeLanguageSourceLevel:
+      factsPayload.authoritativeLanguageSourceLevel || "default-english",
+    authoritativeLanguageFactCount: Array.isArray(
+      factsPayload.authoritativeLanguageFacts
+    )
+      ? factsPayload.authoritativeLanguageFacts.length
+      : 0,
+    latestFactCount: Array.isArray(factsPayload.latestStickyFacts)
+      ? factsPayload.latestStickyFacts.length
+      : 0,
+    otherFrameCount: Array.isArray(factsPayload.otherFilledFrames)
+      ? factsPayload.otherFilledFrames.length
+      : 0,
+    boardSummary: factsPayload.boardSummary || {},
+  };
+}
+
+function formatSuggestionsList(suggestions = []) {
+  if (!Array.isArray(suggestions) || suggestions.length === 0) {
+    return "(empty)";
+  }
+
+  return suggestions.map((suggestion, index) => {
+    const text = String(
+      suggestion?.title || suggestion?.content || suggestion?.text || ""
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+    return `${index + 1}. ${text}`;
+  });
+}
 
 app.use(cors());
 app.use(express.json());
@@ -37,6 +202,12 @@ const BACKGROUND_FILES = [
   "Esquemas_Toolboard.pdf",
   "Prompt_ToolboardGPT_actualizado.docx",
   "libro_pdf_viajeemprendedor (1).pdf",
+];
+const ASSISTANT_KNOWLEDGE_FILES = [
+  ...new Set([
+    ...Object.values(TOOL_KNOWLEDGE_FILES).flat(),
+    ...BACKGROUND_FILES,
+  ]),
 ];
 
 const EMPTY_DIAGNOSIS = {
@@ -330,7 +501,7 @@ const ZH_PREPOSITIONS = [
   "被",
   "给",
 ];
-const ZH_INTERJECTIONS = ["啊", "呀", "哦", "嗯", "唉", "哎"];
+const ZH_INTERJECTIONS = ["啊", "哦", "呀", "哇", "嗯", "唉"];
 const ZH_ADVERBS = [
   "非常",
   "比较",
@@ -347,7 +518,7 @@ const ZH_ADVERBS = [
   "太",
   "较",
   "再",
-  "又",
+  "可",
   "都",
 ];
 const ZH_ADJECTIVES = [
@@ -386,8 +557,285 @@ const ZH_VERBS = [
   "做",
 ];
 
+function loadAssistantMemoryStore() {
+  try {
+    if (!fs.existsSync(ASSISTANT_MEMORY_PATH)) {
+      return { assistantId: null, boards: {} };
+    }
+
+    const raw = fs.readFileSync(ASSISTANT_MEMORY_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    return {
+      assistantId: parsed?.assistantId || null,
+      boards: parsed?.boards && typeof parsed.boards === "object" ? parsed.boards : {},
+    };
+  } catch (error) {
+    logger.warn("Failed to load assistant memory store.", {
+      sections: [{ label: "File", value: ASSISTANT_MEMORY_PATH }],
+      error,
+    });
+    return { assistantId: null, boards: {} };
+  }
+}
+
+function saveAssistantMemoryStore() {
+  fs.writeFileSync(
+    ASSISTANT_MEMORY_PATH,
+    JSON.stringify(assistantMemoryStore, null, 2),
+    "utf8"
+  );
+}
+
+async function extractTextFromPdf(filePath) {
+  const buf = fs.readFileSync(filePath);
+  const uint8 = new Uint8Array(buf);
+  const loadingTask = pdfjsLib.getDocument({
+    data: uint8,
+    useWorkerFetch: false,
+    isEvalSupported: false,
+    useSystemFonts: true,
+  });
+  const pdfDoc = await loadingTask.promise;
+
+  let fullText = "";
+  for (let i = 1; i <= pdfDoc.numPages; i += 1) {
+    const page = await pdfDoc.getPage(i);
+    const content = await page.getTextContent();
+    fullText += content.items.map((item) => item.str).join(" ") + "\n";
+  }
+
+  return fullText;
+}
+
+async function extractKnowledgeText(fileName) {
+  const filePath = path.join(KNOWLEDGE_DIR, fileName);
+  if (!fs.existsSync(filePath)) {
+    return "";
+  }
+
+  const ext = path.extname(filePath).toLowerCase();
+  try {
+    if (ext === ".txt" || ext === ".md") {
+      return fs.readFileSync(filePath, "utf8");
+    }
+
+    if (ext === ".docx") {
+      const buf = fs.readFileSync(filePath);
+      const { value } = await mammoth.extractRawText({ buffer: buf });
+      return value || "";
+    }
+
+    if (ext === ".pdf") {
+      return await extractTextFromPdf(filePath);
+    }
+  } catch (error) {
+    logger.warn("Failed to preload methodology file.", {
+      sections: [{ label: "File", value: fileName }],
+      error,
+    });
+  }
+
+  return "";
+}
+
+function clampAssistantCorpus(text = "", maxChars = 12000) {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxChars)} ...[truncated for assistant bootstrap]`;
+}
+
+async function loadMethodologyCorpus() {
+  if (!methodologyCorpusPromise) {
+    methodologyCorpusPromise = (async () => {
+      const sections = [];
+
+      for (const fileName of ASSISTANT_KNOWLEDGE_FILES) {
+        const text = await extractKnowledgeText(fileName);
+        if (!text.trim()) continue;
+        sections.push(`[Source: ${fileName}]\n${clampAssistantCorpus(text)}`);
+      }
+
+      return sections.join("\n\n---\n\n");
+    })();
+  }
+
+  return methodologyCorpusPromise;
+}
+
+function buildGlobalAssistantInstructions(methodologyCorpus = "") {
+  return `${GLOBAL_ASSISTANT_SYSTEM_ROLE}
+
+You are the permanent Toolboard methodology expert for this workspace.
+You should behave like a long-term strategic advisor who already knows the Toolboard 0-9 framework by heart.
+
+Operating rules:
+- Treat the methodology below as your global memory. Do not ask the user to resend the full methodology.
+- Ground every suggestion in the user's current tool, current question, latest sticky-note facts, and the existing board context.
+- Extend the user's real reasoning instead of inventing a disconnected answer.
+- Keep suggestions concise, specific, and action-oriented.
+- When facts are missing, point out the missing decision or evidence clearly.
+- Preserve the user's dominant language.
+- For suggestion requests, return only valid JSON with a top-level "suggestions" array containing 3 actionable suggestions.
+
+Global Toolboard methodology memory:
+${methodologyCorpus}`;
+}
+
+async function ensureGlobalToolboardAssistant() {
+  if (!assistantBootstrapPromise) {
+    assistantBootstrapPromise = (async () => {
+      const methodologyCorpus = await loadMethodologyCorpus();
+      const desiredInstructions = buildGlobalAssistantInstructions(methodologyCorpus);
+
+      if (assistantMemoryStore.assistantId) {
+        try {
+          const existingAssistant = await openai.beta.assistants.retrieve(
+            assistantMemoryStore.assistantId
+          );
+
+          if (
+            existingAssistant.model !== GLOBAL_ASSISTANT_MODEL ||
+            existingAssistant.name !== GLOBAL_ASSISTANT_NAME ||
+            existingAssistant.instructions !== desiredInstructions
+          ) {
+            return await openai.beta.assistants.update(existingAssistant.id, {
+              name: GLOBAL_ASSISTANT_NAME,
+              model: GLOBAL_ASSISTANT_MODEL,
+              instructions: desiredInstructions,
+              metadata: {
+                app: "toolboard-gpt-miro",
+                role: "global-methodology-expert",
+              },
+            });
+          }
+
+          return existingAssistant;
+        } catch (error) {
+          logger.warn("Stored assistant could not be retrieved. Recreating it.", {
+            sections: [
+              { label: "Assistant ID", value: assistantMemoryStore.assistantId || "(none)" },
+            ],
+            error,
+          });
+          assistantMemoryStore.assistantId = null;
+          saveAssistantMemoryStore();
+        }
+      }
+
+      const assistant = await openai.beta.assistants.create({
+        name: GLOBAL_ASSISTANT_NAME,
+        model: GLOBAL_ASSISTANT_MODEL,
+        instructions: desiredInstructions,
+        metadata: {
+          app: "toolboard-gpt-miro",
+          role: "global-methodology-expert",
+        },
+      });
+
+      assistantMemoryStore.assistantId = assistant.id;
+      saveAssistantMemoryStore();
+      return assistant;
+    })();
+  }
+
+  return assistantBootstrapPromise;
+}
+
+async function ensureBoardThread(boardId = DEFAULT_BOARD_ID) {
+  const normalizedBoardId = String(boardId || DEFAULT_BOARD_ID);
+  const existing = assistantMemoryStore.boards[normalizedBoardId];
+
+  if (existing?.threadId) {
+    try {
+      await openai.beta.threads.retrieve(existing.threadId);
+      return existing.threadId;
+    } catch (error) {
+      logger.warn("Stored thread could not be retrieved. Recreating it.", {
+        sections: [{ label: "Board ID", value: normalizedBoardId }],
+        error,
+      });
+    }
+  }
+
+  const thread = await openai.beta.threads.create({
+    metadata: {
+      board_id: normalizedBoardId,
+      app: "toolboard-gpt-miro",
+    },
+  });
+
+  assistantMemoryStore.boards[normalizedBoardId] = {
+    threadId: thread.id,
+    updatedAt: new Date().toISOString(),
+  };
+  saveAssistantMemoryStore();
+  return thread.id;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const ACTIVE_RUN_STATUSES = new Set([
+  "queued",
+  "in_progress",
+  "requires_action",
+  "cancelling",
+]);
+
+async function waitForRunToSettle(threadId, runId, timeoutMs = 30_000, pollMs = 1_500) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const run = await openai.beta.threads.runs.retrieve(threadId, runId);
+    if (!ACTIVE_RUN_STATUSES.has(run.status)) {
+      return run;
+    }
+    await sleep(pollMs);
+  }
+
+  return openai.beta.threads.runs.retrieve(threadId, runId);
+}
+
+async function ensureNoActiveRunOnThread(threadId) {
+  const runsPage = await openai.beta.threads.runs.list(threadId, { limit: 10 });
+  const activeRun = (runsPage.data || []).find((run) =>
+    ACTIVE_RUN_STATUSES.has(run.status)
+  );
+
+  if (!activeRun) {
+    return null;
+  }
+
+  logger.warn("Active assistant run detected. Waiting before starting a new run.", {
+    sections: [
+      { label: "Thread ID", value: threadId },
+      { label: "Run ID", value: activeRun.id },
+      { label: "Run Status", value: activeRun.status },
+    ],
+  });
+
+  let settledRun = await waitForRunToSettle(threadId, activeRun.id, 8_000, 1_000);
+  if (!ACTIVE_RUN_STATUSES.has(settledRun.status)) {
+    return settledRun;
+  }
+
+  if (settledRun.status === "queued" || settledRun.status === "in_progress") {
+    logger.warn("Active run did not settle in time. Cancelling it to avoid thread conflicts.", {
+      sections: [
+        { label: "Thread ID", value: threadId },
+        { label: "Run ID", value: settledRun.id },
+        { label: "Run Status", value: settledRun.status },
+      ],
+    });
+    await openai.beta.threads.runs.cancel(threadId, settledRun.id);
+    settledRun = await waitForRunToSettle(threadId, settledRun.id, 15_000, 1_000);
+  }
+
+  return settledRun;
 }
 
 function parseJsonResponse(raw, fallback = null) {
@@ -423,9 +871,18 @@ async function createChatCompletionWithRetry(payload) {
 
   while (true) {
     try {
-      console.log("=== OpenAI Chat Completion Payload ===");
-      console.log(JSON.stringify(payload, null, 2));
-      console.log("=== End OpenAI Payload ===");
+      logger.debug("OpenAI chat completion request.", {
+        sections: [
+          {
+            label: "Payload Summary",
+            value: summarizeChatPayload(payload),
+            format: "json",
+          },
+          ...(LOG_LEVEL === "debug"
+            ? [{ label: "Payload", value: payload, format: "json" }]
+            : []),
+        ],
+      });
       return await openai.chat.completions.create(payload);
     } catch (error) {
       if (!isRetryableOpenAIError(error) || attempt >= OPENAI_MAX_RETRIES) {
@@ -435,13 +892,71 @@ async function createChatCompletionWithRetry(payload) {
       const retryDelayMs =
         getRetryAfterMs(error) ?? Math.min(1000 * 2 ** attempt, 8000);
 
-      console.warn(
-        `OpenAI request failed with status ${error?.status}. Retrying in ${retryDelayMs}ms (attempt ${attempt + 1}/${OPENAI_MAX_RETRIES}).`
-      );
+      logger.warn("OpenAI request failed. Retrying.", {
+        sections: [
+          { label: "HTTP Status", value: error?.status ?? "unknown" },
+          { label: "Retry Delay (ms)", value: retryDelayMs },
+          {
+            label: "Attempt",
+            value: `${attempt + 1}/${OPENAI_MAX_RETRIES}`,
+          },
+        ],
+        error,
+      });
 
       await sleep(retryDelayMs);
       attempt += 1;
     }
+  }
+}
+
+async function detectLanguageWithModel(text = "", fallbackLanguage = "EN") {
+  const normalizedText = String(text || "").trim();
+  if (!normalizedText) {
+    return fallbackLanguage;
+  }
+  try {
+    const completion = await createChatCompletionWithRetry({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            'You are a language classifier. Based only on the user text you receive, return exactly one code: EN, ZH, ES, or CA. If the text is empty, unclear, or mixed without a dominant language, return EN. Do not explain your choice.',
+        },
+        {
+          role: "user",
+          content: normalizedText,
+        },
+      ],
+      temperature: 0,
+      max_tokens: 5,
+    });
+
+    const raw = (completion.choices[0]?.message?.content || "").trim().toUpperCase();
+    const normalized = raw.match(/\b(EN|ZH|ES|CA)\b/)?.[1] || fallbackLanguage;
+
+    logger.debug("Model-based language detection completed.", {
+      sections: [
+        { label: "Detected Language", value: normalized },
+        {
+          label: "Source Text",
+          value: truncateFactText(normalizedText, 280),
+        },
+      ],
+    });
+
+    return normalized;
+  } catch (error) {
+    const fallback = detectLanguageCode(normalizedText, fallbackLanguage);
+    logger.warn("Model-based language detection failed. Falling back to heuristic detection.", {
+      sections: [
+        { label: "Fallback Language", value: fallback },
+        { label: "Source Text", value: truncateFactText(normalizedText, 280) },
+      ],
+      error,
+    });
+    return fallback;
   }
 }
 
@@ -479,7 +994,7 @@ function checkRateLimit(req) {
 function detectLanguageCode(text = "", forcedLang = "") {
   if (forcedLang) {
     const normalized = forcedLang.toUpperCase();
-    if (["ZH", "EN", "ES"].includes(normalized)) {
+    if (["ZH", "EN", "ES", "CA"].includes(normalized)) {
       return normalized;
     }
   }
@@ -488,30 +1003,94 @@ function detectLanguageCode(text = "", forcedLang = "") {
     return "ZH";
   }
 
-  if (/[áéíóúüñ¿¡]/i.test(text)) {
+  const lower = text.toLowerCase();
+  const countHints = (source, hints) =>
+    hints.reduce((count, hint) => count + (source.includes(hint) ? 1 : 0), 0);
+  const catalanHints = [
+    " el ",
+    " la ",
+    " de ",
+    " per ",
+    " amb ",
+    " projecte ",
+    " mercat ",
+    " client ",
+    " proposta ",
+    " equip ",
+    " validacio ",
+    " estratègia ",
+    " estrategia ",
+    " valor ",
+    " usuaris ",
+    " servei ",
+    " aquest ",
+    " aquesta ",
+    " els ",
+    " les ",
+    " una ",
+    " un ",
+    " i ",
+    " que ",
+    " dels ",
+    " al ",
+    " pel ",
+    " com ",
+    " model de negoci ",
+    " proposta de valor ",
+    " però ",
+    " perque ",
+    " perquè ",
+  ];
+  const catalanScore = countHints(lower, catalanHints);
+  if (/[àèéíïòóúüç]/i.test(text) || catalanScore >= 2) {
+    return "CA";
+  }
+
+  if (/[áéíóúñü¿¡]/i.test(text)) {
     return "ES";
   }
 
-  const lower = text.toLowerCase();
   const spanishHints = [
     " el ",
     " la ",
     " de ",
     " para ",
     " con ",
+    " por ",
+    " los ",
+    " las ",
+    " una ",
+    " un ",
+    " y ",
+    " que ",
+    " del ",
+    " al ",
+    " como ",
     " mercado ",
     " cliente ",
     " propuesta ",
+    " usuarios ",
+    " servicio ",
+    " modelo de negocio ",
+    " propuesta de valor ",
   ];
-  if (spanishHints.some((hint) => lower.includes(hint))) {
+  const spanishScore = countHints(lower, spanishHints);
+  if (spanishScore >= 2) {
     return "ES";
   }
 
   return "EN";
 }
 
+function getLanguageLabel(langCode = "EN") {
+  if (langCode === "ZH") return "Chinese";
+  if (langCode === "ES") return "Spanish";
+  if (langCode === "CA") return "Catalan";
+  return "English";
+}
+
 function splitSentences(text = "", lang = "EN") {
-  const pattern = lang === "ZH" ? /[。！？；\n]+/ : /[.!?;\n]+/;
+  const pattern = lang === "ZH" ? /[銆傦紒锛燂紱\n]+/ : /[.!?;\n]+/;
   return text
     .split(pattern)
     .map((part) => part.trim())
@@ -519,7 +1098,7 @@ function splitSentences(text = "", lang = "EN") {
 }
 
 function tokenizeWestern(text = "") {
-  return (text.toLowerCase().match(/[a-záéíóúüñ']+/gi) || []).map((token) =>
+  return (text.toLowerCase().match(/[a-z谩茅铆贸煤眉帽']+/gi) || []).map((token) =>
     token.toLowerCase()
   );
 }
@@ -762,16 +1341,24 @@ export function analyzeFormality(text, lang = "", options = {}) {
     (detectedLang === "ZH" &&
       countOccurrences(normalizedText, [...ZH_PROFESSIONAL_NOUN_TERMS]) > 0);
 
-  console.log("analyzeFormality.input", {
-    detectedLang,
-    rawText: normalizedText,
-    totalTokens,
-    effectiveTokenCount,
-    cjkCharCount,
-    sentenceCount: sentences.length,
-    shortTextPenaltyFactor,
-    isTrustedContent,
-    trustedByHash,
+  logger.debug("Formality analysis input.", {
+    sections: [
+      {
+        label: "Input",
+        value: {
+          detectedLang,
+          rawText: normalizedText,
+          totalTokens,
+          effectiveTokenCount,
+          cjkCharCount,
+          sentenceCount: sentences.length,
+          shortTextPenaltyFactor,
+          isTrustedContent,
+          trustedByHash,
+        },
+        format: "json",
+      },
+    ],
   });
 
   if (isTrustedContent) {
@@ -807,12 +1394,20 @@ export function analyzeFormality(text, lang = "", options = {}) {
   }
 
   if (structurallyTooShort) {
-    console.log("analyzeFormality.tooShort", {
-      detectedLang,
-      rawText: normalizedText,
-      totalTokens,
-      effectiveTokenCount,
-      cjkCharCount,
+    logger.debug("Formality analysis flagged content as too short.", {
+      sections: [
+        {
+          label: "Too Short Evaluation",
+          value: {
+            detectedLang,
+            rawText: normalizedText,
+            totalTokens,
+            effectiveTokenCount,
+            cjkCharCount,
+          },
+          format: "json",
+        },
+      ],
     });
     return {
       lang: detectedLang,
@@ -892,7 +1487,7 @@ export function analyzeFormality(text, lang = "", options = {}) {
       interjPercent +
       100) /
     2;
-  if (detectedLang === "ZH" && /我|觉得/.test(normalizedText)) {
+  if (detectedLang === "ZH" && /鎴憒瑙夊緱/.test(normalizedText)) {
     rawFScore = Math.min(rawFScore, 50);
   }
   const formalityScore = Math.max(0, Math.min(100, Math.round(rawFScore)));
@@ -984,29 +1579,37 @@ export function analyzeFormality(text, lang = "", options = {}) {
   }
   const needsRefinement = overallScore < 60;
 
-  console.log("analyzeFormality.metrics", {
-    detectedLang,
-    totalTokens,
-    effectiveTokenCount,
-    cjkCharCount,
-    noun_count: weightedCounts.noun,
-    adj_count: weightedCounts.adj,
-    prep_count: weightedCounts.prep,
-    art_count: weightedCounts.art,
-    pron_count: weightedCounts.pron,
-    verb_count: weightedCounts.verb,
-    adv_count: weightedCounts.adv,
-    interj_count: weightedCounts.interj,
-    formalityScore,
-    lexicalDensity,
-    syntacticComplexity,
-    overallScore,
-    avgSentenceLength,
-    level,
-    shortTextPenaltyFactor,
-    professionalTermCount,
-    nounRatio,
-    isSystemRefined,
+  logger.debug("Formality analysis metrics.", {
+    sections: [
+      {
+        label: "Metrics",
+        value: {
+          detectedLang,
+          totalTokens,
+          effectiveTokenCount,
+          cjkCharCount,
+          noun_count: weightedCounts.noun,
+          adj_count: weightedCounts.adj,
+          prep_count: weightedCounts.prep,
+          art_count: weightedCounts.art,
+          pron_count: weightedCounts.pron,
+          verb_count: weightedCounts.verb,
+          adv_count: weightedCounts.adv,
+          interj_count: weightedCounts.interj,
+          formalityScore,
+          lexicalDensity,
+          syntacticComplexity,
+          overallScore,
+          avgSentenceLength,
+          level,
+          shortTextPenaltyFactor,
+          professionalTermCount,
+          nounRatio,
+          isSystemRefined,
+        },
+        format: "json",
+      },
+    ],
   });
 
   return {
@@ -1034,7 +1637,7 @@ export function analyzeFormality(text, lang = "", options = {}) {
 async function rewriteFormalText(text, lang = "") {
   const detectedLang = detectLanguageCode(text, lang);
   const promptLanguage =
-    detectedLang === "ZH" ? "中文" : detectedLang === "ES" ? "西班牙语" : "English";
+    detectedLang === "ZH" ? "涓枃" : detectedLang === "ES" ? "瑗跨彮鐗欒" : "English";
 
   const completion = await createChatCompletionWithRetry({
     model: "gpt-4o",
@@ -1042,7 +1645,7 @@ async function rewriteFormalText(text, lang = "") {
       {
         role: "system",
         content:
-          "你是一名资深商业顾问。请将以下 [Lang] 文本重写为具备高 F-score、高词汇密度和严密句法结构的正式商业表述。保留核心事实，去除口语虚词（如：觉得、好像、creo que, I think, 呢/吧）。只返回改写后的文本。",
+          "You are a senior business advisor. Rewrite the following [Lang] text into a formal business statement with a high F-score, high lexical density, and strong syntactic structure. Preserve the core facts, remove conversational fillers such as 觉得, 好像, creo que, and I think, and return only the rewritten text.",
       },
       {
         role: "user",
@@ -1132,7 +1735,7 @@ async function rewriteFormalTextWithContext(text, lang = "", context = {}) {
       {
         role: "system",
         content:
-          "You are a professional entrepreneurship mentor. Your task is to optimize a beginner-level idea written on a Miro sticky note.\n\nCurrent context:\n- The user is working in [{{toolTitle}}] during [{{questionDescription}}].\n- The core goal of this step is [{{methodologyGoal}}].\n- For this tool, the rewrite should especially [{{toolSpecificFocus}}].\n\nRewrite rules:\n- Reject superficial polishing. If the source text is sparse, do not merely swap synonyms.\n- Use logical placeholder guidance. Rewrite the note into a professional, structured statement.\n- When critical information is missing for this step, insert bracketed placeholders such as [target user segment], [evidence to validate], or [delivery constraint] so the user knows what to complete next.\n- Preserve the user's intent and keep the rewritten text relatively close in length.\n- Remove subjective fillers such as 我觉得, 感觉, 好像, creo que, pienso que, I think, or I feel.\n- Return only the rewritten text in the same language as the source, with no preamble or explanation.",
+          "You are a professional entrepreneurship mentor. Your task is to optimize a beginner-level idea written on a Miro sticky note.\n\nCurrent context:\n- The user is working in [{{toolTitle}}] during [{{questionDescription}}].\n- The core goal of this step is [{{methodologyGoal}}].\n- For this tool, the rewrite should especially [{{toolSpecificFocus}}].\n\nRewrite rules:\n- Reject superficial polishing. If the source text is sparse, do not merely swap synonyms.\n- Use logical placeholder guidance. Rewrite the note into a professional, structured statement.\n- When critical information is missing for this step, insert bracketed placeholders such as [target user segment], [evidence to validate], or [delivery constraint] so the user knows what to complete next.\n- Preserve the user's intent and keep the rewritten text relatively close in length.\n- Remove subjective fillers such as 鎴戣寰? 鎰熻, 濂藉儚, creo que, pienso que, I think, or I feel.\n- Return only the rewritten text in the same language as the source, with no preamble or explanation.",
       },
       {
         role: "user",
@@ -1252,6 +1855,23 @@ function extractQuestionNotes(question = {}) {
     .filter(Boolean);
 }
 
+function extractQuestionUserNotes(question = {}) {
+  const noteDetails = Array.isArray(question.noteDetails)
+    ? question.noteDetails
+    : (question.notes ?? []).map((text) => ({ text }));
+
+  return noteDetails
+    .filter((note) => {
+      if (!String(note?.text || "").trim()) {
+        return false;
+      }
+
+      return note?.isSystemGenerated !== true && note?.refinedByAgent !== true;
+    })
+    .map((note) => String(note?.text || "").trim())
+    .filter(Boolean);
+}
+
 function buildCurrentContextFromBoard(boardContext = [], note = {}) {
   const currentTool = boardContext.find((tool) => tool.toolId === note.toolId);
   const toolContext = (currentTool?.questions ?? [])
@@ -1289,6 +1909,525 @@ function buildCurrentContextFromBoard(boardContext = [], note = {}) {
   };
 }
 
+function truncateFactText(text = "", maxLength = 160) {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxLength)}...`;
+}
+
+function extractLatestQuestionFacts(question = {}, maxFacts = 4) {
+  const noteDetails = Array.isArray(question.noteDetails)
+    ? question.noteDetails
+    : (question.notes ?? []).map((text) => ({ text }));
+
+  return noteDetails
+    .map((note) => String(note?.text || "").trim())
+    .filter(Boolean)
+    .slice(-maxFacts)
+    .map((text) => truncateFactText(text, 220));
+}
+
+function buildAuthoritativeLanguageSource(
+  boardContext = [],
+  focusToolId = null,
+  focusQuestionId = "",
+  maxFacts = 12
+) {
+  const currentTool = boardContext.find((entry) => entry.toolId === focusToolId);
+  const currentQuestion = (currentTool?.questions ?? []).find(
+    (entry) => entry.qId === focusQuestionId
+  );
+  const currentQuestionUserNotes = extractQuestionUserNotes(currentQuestion)
+    .slice(-maxFacts)
+    .map((text) => truncateFactText(text, 220));
+
+  if (currentQuestionUserNotes.length > 0) {
+    return {
+      facts: currentQuestionUserNotes,
+      sourceLevel: "current-question-user-notes",
+    };
+  }
+
+  const historicalUserNotes = flattenNotes(boardContext)
+    .filter(
+      (note) =>
+        note.isSystemGenerated !== true &&
+        note.refinedByAgent !== true &&
+        String(note.text || "").trim()
+    )
+    .filter(
+      (note) => !(note.toolId === focusToolId && note.qId === focusQuestionId)
+    )
+    .slice(-maxFacts)
+    .map((note) => truncateFactText(note.text, 220));
+
+  if (historicalUserNotes.length > 0) {
+    return {
+      facts: historicalUserNotes,
+      sourceLevel: "historical-user-notes",
+    };
+  }
+
+  return {
+    facts: [],
+    sourceLevel: "default-english",
+  };
+}
+
+function buildFilledFrameSummaries(
+  boardContext = [],
+  focusToolId = null,
+  focusQuestionId = "",
+  maxFrames = 10
+) {
+  const summaries = [];
+
+  for (const tool of boardContext) {
+    for (const question of tool.questions ?? []) {
+      const notes = extractQuestionNotes(question);
+      if (notes.length === 0) continue;
+      if (tool.toolId === focusToolId && question.qId === focusQuestionId) continue;
+
+      summaries.push({
+        toolId: tool.toolId,
+        toolName: tool.toolName,
+        questionId: question.qId,
+        frameTitle: question.anchorFrameTitle,
+        summary: truncateFactText(notes.join(" | "), 220),
+      });
+    }
+  }
+
+  return summaries.slice(0, maxFrames);
+}
+
+function countQuestionPrompts(label = "") {
+  const text = String(label || "").trim();
+  if (!text) {
+    return 0;
+  }
+
+  const matches = text.match(/\?/g);
+  return matches ? matches.length : 0;
+}
+
+function getSuggestionCountPlan(focusQuestion = {}) {
+  const subQuestionCount = countQuestionPrompts(focusQuestion?.label || "");
+  const isMultiSubQuestion = subQuestionCount >= 4;
+  const targetCount = isMultiSubQuestion
+    ? Math.min(Math.max(subQuestionCount, 4), 5)
+    : 3;
+
+  return {
+    subQuestionCount,
+    isMultiSubQuestion,
+    targetCount,
+  };
+}
+
+function buildIncrementalFactsPayload({
+  boardContext = [],
+  toolId = null,
+  toolName = "",
+  toolDescription = "",
+  focusQuestion = {},
+  preferredLanguage = "",
+  dominantLanguageOverride = "",
+} = {}) {
+  const currentTool = boardContext.find((entry) => entry.toolId === toolId);
+  const dominantLanguage =
+    dominantLanguageOverride ||
+    getPreferredSuggestionLanguage(
+      boardContext,
+      toolId,
+      focusQuestion?.qId || "",
+      preferredLanguage
+    );
+  const currentQuestion = (currentTool?.questions ?? []).find(
+    (entry) => entry.qId === focusQuestion?.qId
+  );
+  const authoritativeLanguageSource = buildAuthoritativeLanguageSource(
+    boardContext,
+    toolId,
+    focusQuestion?.qId || ""
+  );
+  const latestFacts = extractLatestQuestionFacts(currentQuestion);
+  const otherFrameSummaries = buildFilledFrameSummaries(
+    boardContext,
+    toolId,
+    focusQuestion?.qId || ""
+  );
+  const boardSummary = summarizeBoardContext(boardContext);
+  const suggestionCountPlan = getSuggestionCountPlan(focusQuestion);
+
+  return {
+    currentTool: {
+      toolId,
+      toolName,
+      toolDescription,
+    },
+    targetQuestion: {
+      qId: focusQuestion?.qId || "",
+      label: focusQuestion?.label || "",
+      anchorFrameTitle: focusQuestion?.anchorFrameTitle || "",
+    },
+    authoritativeLanguageFacts: authoritativeLanguageSource.facts,
+    authoritativeLanguageSourceLevel:
+      authoritativeLanguageSource.sourceLevel,
+    suggestionCountPlan,
+    latestStickyFacts: latestFacts,
+    otherFilledFrames: otherFrameSummaries,
+    boardSummary: {
+      filledFrames: boardSummary.filledFrames,
+      totalFrames: boardSummary.totalFrames,
+      completionScore: boardSummary.completionScore,
+    },
+    dominantLanguage,
+  };
+}
+
+function formatIncrementalFactsMessage(factsPayload, eventType = "analyse") {
+  const languageLabel = getLanguageLabel(factsPayload.dominantLanguage);
+
+  return [
+    `Event: ${eventType}`,
+    `Required response language: ${languageLabel} (${factsPayload.dominantLanguage})`,
+    `Current tool: ${factsPayload.currentTool.toolName} (#${factsPayload.currentTool.toolId})`,
+    `Current question: ${factsPayload.targetQuestion.label}`,
+    `Current frame: ${factsPayload.targetQuestion.anchorFrameTitle}`,
+    `Authoritative language source level: ${factsPayload.authoritativeLanguageSourceLevel}`,
+    `Suggestion count plan: ${JSON.stringify(factsPayload.suggestionCountPlan)}`,
+    `Authoritative language facts: ${JSON.stringify(
+      factsPayload.authoritativeLanguageFacts
+    )}`,
+    `Latest sticky facts: ${JSON.stringify(factsPayload.latestStickyFacts)}`,
+    `Other filled frame summaries: ${JSON.stringify(factsPayload.otherFilledFrames)}`,
+    `Board summary: ${JSON.stringify(factsPayload.boardSummary)}`,
+  ].join("\n");
+}
+
+async function extractLatestAssistantReply(threadId) {
+  const messages = await openai.beta.threads.messages.list(threadId, {
+    order: "desc",
+    limit: 10,
+  });
+  const latestAssistantMessage = messages.data.find(
+    (message) => message.role === "assistant"
+  );
+
+  if (!latestAssistantMessage) {
+    return "";
+  }
+
+  return latestAssistantMessage.content
+    .map((block) => {
+      if (block.type === "text") {
+        return block.text?.value || "";
+      }
+
+      return "";
+    })
+    .join("\n")
+    .trim();
+}
+
+function doSuggestionsMatchLanguage(suggestions = [], targetLanguage = "EN") {
+  const combinedText = suggestions
+    .flatMap((suggestion) => [suggestion?.title || "", suggestion?.content || suggestion?.text || ""])
+    .join(" ")
+    .trim();
+
+  if (!combinedText) {
+    return true;
+  }
+
+  return detectLanguageCode(combinedText) === targetLanguage;
+}
+
+async function realignSuggestionsToLanguage(suggestions = [], targetLanguage = "EN") {
+  const languageLabel = getLanguageLabel(targetLanguage);
+  const completion = await createChatCompletionWithRetry({
+    model: "gpt-4o",
+    messages: [
+      {
+        role: "system",
+        content:
+          `You are a precise JSON editor. Rewrite the suggestion titles and contents so they are entirely in ${languageLabel}. Preserve the meaning, business intent, and JSON structure. Return only valid JSON in the form {"suggestions":[{"id":"s1","title":"...","content":"..."},{"id":"s2","title":"...","content":"..."},{"id":"s3","title":"...","content":"..."}]}. Do not mix languages.`,
+      },
+      {
+        role: "user",
+        content: JSON.stringify({ suggestions }),
+      },
+    ],
+    temperature: 0.2,
+    max_tokens: 1200,
+  });
+  return parseJsonResponse(completion.choices[0]?.message?.content || "", null);
+}
+
+async function generateDirectSuggestions({
+  factsPayload,
+  toolName = "",
+  toolDescription = "",
+} = {}) {
+  const targetLanguage = factsPayload?.dominantLanguage || "EN";
+  const languageLabel = getLanguageLabel(targetLanguage);
+  const authoritativeLanguageFacts = Array.isArray(
+    factsPayload?.authoritativeLanguageFacts
+  )
+    ? factsPayload.authoritativeLanguageFacts
+    : [];
+  const authoritativeLanguageSourceLevel =
+    factsPayload?.authoritativeLanguageSourceLevel || "default-english";
+  const suggestionCountPlan = factsPayload?.suggestionCountPlan || {
+    subQuestionCount: 0,
+    isMultiSubQuestion: false,
+    targetCount: 3,
+  };
+  const latestStickyFacts = Array.isArray(factsPayload?.latestStickyFacts)
+    ? factsPayload.latestStickyFacts
+    : [];
+  const otherFilledFrames = Array.isArray(factsPayload?.otherFilledFrames)
+    ? factsPayload.otherFilledFrames
+    : [];
+  const targetQuestion = factsPayload?.targetQuestion || {};
+  const currentTool = factsPayload?.currentTool || {};
+
+  const systemPrompt = `You are a senior Toolboard consultant who has fully mastered the complete Toolboard methodology.
+
+Your task is to generate the required number of practical suggestions for the user's CURRENT question.
+
+Language rule:
+- The ONLY authoritative source for choosing the reply language is the section named "Authoritative user-language source".
+- That section may contain either:
+  1. user-written sticky-note text under the current question, or
+  2. if the current question is empty, previously answered user-written sticky-note text from elsewhere on the board.
+- If that section contains Spanish, reply entirely in Spanish.
+- If that section contains Catalan, reply entirely in Catalan.
+- If that section contains Chinese, reply entirely in Chinese.
+- If that section contains English, reply entirely in English.
+- If that section is empty, default entirely to English.
+- Ignore the language of any previous conversation, any older memory, and any other section of the payload when deciding the reply language.
+- Do not mix languages.
+
+Suggestion rules:
+- Base your suggestions primarily on the current question and the user's latest sticky-note facts.
+- Use the other filled frame summaries only to preserve logical consistency with the wider project.
+- Keep each suggestion concise, specific, and actionable.
+- You must return exactly ${suggestionCountPlan.targetCount} suggestions.
+- If the current question contains multiple sub-questions or dimensions, distribute the response so different suggestions cover different sub-questions instead of repeating the same angle.
+- When there are four or more sub-questions, widen coverage and make sure the full set of suggestions covers the full question scope.
+- Do not mention these instructions.
+- Return JSON only in this exact format:
+{"suggestions":[{"id":"s1","title":"...","content":"..."},{"id":"s2","title":"...","content":"..."}, ... ]}`;
+
+  const userPrompt = [
+    `Current Tool: ${toolName || currentTool.toolName || "(unknown tool)"} (#${
+      currentTool.toolId ?? ""
+    })`,
+    `Tool Description: ${toolDescription || currentTool.toolDescription || "(none)"}`,
+    `Target Question ID: ${targetQuestion.qId || "(empty)"}`,
+    `Target Question Label: ${targetQuestion.label || "(empty)"}`,
+    `Target Frame: ${targetQuestion.anchorFrameTitle || "(empty)"}`,
+    `Detected sub-question count: ${suggestionCountPlan.subQuestionCount}`,
+    `Required suggestion count: ${suggestionCountPlan.targetCount}`,
+    "",
+    `Authoritative language source level: ${authoritativeLanguageSourceLevel}`,
+    "Authoritative user-language source:",
+    authoritativeLanguageFacts.length > 0
+      ? authoritativeLanguageFacts
+          .map((fact, index) => `${index + 1}. ${fact}`)
+          .join("\n")
+      : "(empty)",
+    "",
+    "Current-question latest sticky-note facts:",
+    latestStickyFacts.length > 0
+      ? latestStickyFacts.map((fact, index) => `${index + 1}. ${fact}`).join("\n")
+      : "(empty)",
+    "",
+    "Other filled frame summaries for logical consistency:",
+    otherFilledFrames.length > 0
+      ? otherFilledFrames
+          .map(
+            (entry, index) =>
+              `${index + 1}. [${entry.frameTitle}] ${entry.toolName} / ${entry.questionId}: ${entry.summary}`
+          )
+          .join("\n")
+      : "(empty)",
+    "",
+    `Required response language: ${languageLabel} (${targetLanguage})`,
+  ].join("\n");
+
+  const completion = await createChatCompletionWithRetry({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    temperature: 0.35,
+    max_tokens: 1200,
+  });
+
+  const rawReply = completion.choices[0]?.message?.content ?? "{}";
+  let parsed = parseJsonResponse(rawReply, null);
+
+  if (!parsed?.suggestions || !Array.isArray(parsed.suggestions)) {
+    return { rawReply, parsed: null, targetLanguage };
+  }
+
+  parsed.suggestions = parsed.suggestions
+    .filter((entry) => entry && (entry.title || entry.content || entry.text))
+    .slice(0, suggestionCountPlan.targetCount)
+    .map((entry, index) => ({
+      id: entry.id || `s${index + 1}`,
+      title: entry.title || `Suggestion ${index + 1}`,
+      content: entry.content || entry.text || "",
+    }));
+
+  if (!doSuggestionsMatchLanguage(parsed.suggestions, targetLanguage)) {
+    logger.warn("Suggestion language drift detected in direct suggestion mode. Realigning output.", {
+      sections: [
+        { label: "Expected Language", value: `${languageLabel} (${targetLanguage})` },
+        { label: "Detected Output", value: formatSuggestionsList(parsed.suggestions) },
+      ],
+    });
+    const realigned = await realignSuggestionsToLanguage(parsed.suggestions, targetLanguage);
+    if (realigned?.suggestions && Array.isArray(realigned.suggestions)) {
+      parsed = realigned;
+    }
+  }
+
+  return {
+    rawReply,
+    parsed,
+    targetLanguage,
+  };
+}
+
+async function syncThreadMemory({
+  boardId = DEFAULT_BOARD_ID,
+  boardContext = [],
+  toolId = null,
+  toolName = "",
+  toolDescription = "",
+  focusQuestion = null,
+  preferredLanguage = "",
+  eventType = "preview",
+} = {}) {
+  const assistant = await ensureGlobalToolboardAssistant();
+  const threadId = await ensureBoardThread(boardId);
+  const dominantLanguageOverride =
+    eventType === "analyse"
+      ? await detectSuggestionLanguageWithModel(
+          boardContext,
+          toolId,
+          focusQuestion?.qId || ""
+        )
+      : "";
+  const factsPayload = buildIncrementalFactsPayload({
+    boardContext,
+    toolId,
+    toolName,
+    toolDescription,
+    focusQuestion: focusQuestion || {},
+    preferredLanguage,
+    dominantLanguageOverride,
+  });
+  const content = formatIncrementalFactsMessage(factsPayload, eventType);
+
+  await openai.beta.threads.messages.create(threadId, {
+    role: "user",
+    content,
+    metadata: {
+      board_id: String(boardId || DEFAULT_BOARD_ID),
+      event_type: eventType,
+      focus_frame: factsPayload.targetQuestion.anchorFrameTitle || "board-summary",
+    },
+  });
+
+  assistantMemoryStore.boards[String(boardId || DEFAULT_BOARD_ID)] = {
+    ...(assistantMemoryStore.boards[String(boardId || DEFAULT_BOARD_ID)] || {}),
+    threadId,
+    updatedAt: new Date().toISOString(),
+  };
+  saveAssistantMemoryStore();
+
+  return {
+    assistantId: assistant.id,
+    threadId,
+    factsPayload,
+  };
+}
+
+async function generateAssistantSuggestionsFromThread({
+  threadId,
+  assistantId,
+  factsPayload,
+}) {
+  await ensureNoActiveRunOnThread(threadId);
+
+  const targetLanguage = factsPayload?.dominantLanguage || "EN";
+  const responseLanguage = getLanguageLabel(targetLanguage);
+  const currentStickyLanguageEvidence = Array.isArray(factsPayload?.latestStickyFacts)
+    ? factsPayload.latestStickyFacts.join(" | ")
+    : "";
+
+  const run = await openai.beta.threads.runs.createAndPoll(threadId, {
+    assistant_id: assistantId,
+    additional_instructions:
+      `Respond with only valid JSON in the form {"suggestions":[{"id":"s1","title":"...","content":"..."},{"id":"s2","title":"...","content":"..."},{"id":"s3","title":"...","content":"..."}]}. Use the thread memory plus the new facts for this run. The language of the user's current sticky-note answer is ${responseLanguage}. Every suggestion title and every suggestion content field must be written entirely in ${responseLanguage}. Base your reply language on the user's current sticky-note text, not on any previous thread language. Do not mix languages and do not default back to a previous thread language. Current sticky-note language evidence: ${currentStickyLanguageEvidence || "(empty)"}.`,
+    response_format: { type: "json_object" },
+    temperature: 0.4,
+  });
+
+  if (run.status !== "completed") {
+    logger.error("Assistant run failed before completion.", {
+      sections: [
+        { label: "Thread ID", value: threadId },
+        { label: "Run ID", value: run.id },
+        { label: "Run Status", value: run.status },
+        { label: "Last Error", value: run.last_error || "(none)", format: "json" },
+        {
+          label: "Incomplete Details",
+          value: run.incomplete_details || "(none)",
+          format: "json",
+        },
+      ],
+    });
+    throw new Error(`Assistant run ended with status ${run.status}`);
+  }
+
+  const rawReply = await extractLatestAssistantReply(threadId);
+  let parsed = parseJsonResponse(rawReply, null);
+
+  if (
+    parsed?.suggestions &&
+    Array.isArray(parsed.suggestions) &&
+    !doSuggestionsMatchLanguage(parsed.suggestions, targetLanguage)
+  ) {
+    logger.warn("Assistant suggestions language drift detected. Realigning response language.", {
+      sections: [
+        { label: "Thread ID", value: threadId },
+        { label: "Run ID", value: run.id },
+        { label: "Target Language", value: targetLanguage },
+      ],
+    });
+    const realigned = await realignSuggestionsToLanguage(parsed.suggestions, targetLanguage);
+    if (realigned?.suggestions && Array.isArray(realigned.suggestions)) {
+      parsed = realigned;
+    }
+  }
+
+  return {
+    runId: run.id,
+    rawReply,
+    parsed,
+  };
+}
+
 async function buildQualityAlert(boardContext = []) {
   const notes = flattenNotes(boardContext);
   if (notes.length === 0) {
@@ -1313,13 +2452,21 @@ async function buildQualityAlert(boardContext = []) {
     substantiveNotes.find((entry) => entry.audit.level === "semi-formal") ||
     (substantiveNotes.length === 0 ? shortNotes[0] : null);
 
-  console.log("buildQualityAlert.selection", {
-    totalNotes: notes.length,
-    substantiveNotes: substantiveNotes.length,
-    shortNotes: shortNotes.length,
-    selectedText: candidate?.text || null,
-    selectedLevel: candidate?.audit?.level || null,
-    selectedTooShort: candidate?.audit?.tooShort || false,
+  logger.debug("Quality alert candidate selection.", {
+    sections: [
+      {
+        label: "Selection",
+        value: {
+          totalNotes: notes.length,
+          substantiveNotes: substantiveNotes.length,
+          shortNotes: shortNotes.length,
+          selectedText: candidate?.text || null,
+          selectedLevel: candidate?.audit?.level || null,
+          selectedTooShort: candidate?.audit?.tooShort || false,
+        },
+        format: "json",
+      },
+    ],
   });
 
   if (!candidate) {
@@ -1638,6 +2785,165 @@ function summarizeBoardContext(boardContext = []) {
   };
 }
 
+function getBoardLanguage(boardContext = []) {
+  const notesText = flattenNotes(boardContext)
+    .map((note) => note.text)
+    .filter(Boolean)
+    .join(" ");
+
+  return detectLanguageCode(notesText);
+}
+
+async function detectBoardLanguageWithModel(boardContext = []) {
+  const notesText = flattenNotes(boardContext)
+    .map((note) => note.text)
+    .filter(Boolean)
+    .join("\n");
+
+  if (!notesText.trim()) {
+    return "EN";
+  }
+
+  return detectLanguageWithModel(notesText, "EN");
+}
+
+function getPreferredSuggestionLanguage(
+  boardContext = [],
+  focusToolId = null,
+  focusQuestionId = "",
+  preferredLanguage = ""
+) {
+  if (preferredLanguage) {
+    return detectLanguageCode("", preferredLanguage);
+  }
+
+  const currentTool = boardContext.find((entry) => entry.toolId === focusToolId);
+  const currentQuestion = (currentTool?.questions ?? []).find(
+    (entry) => entry.qId === focusQuestionId
+  );
+  const currentQuestionText = extractQuestionNotes(currentQuestion).join(" ").trim();
+  if (currentQuestionText) {
+    return detectLanguageCode(currentQuestionText);
+  }
+
+  const currentToolText = (currentTool?.questions ?? [])
+    .flatMap((question) => extractQuestionNotes(question))
+    .join(" ")
+    .trim();
+  if (currentToolText) {
+    return detectLanguageCode(currentToolText);
+  }
+
+  return getBoardLanguage(boardContext);
+}
+
+function getCurrentQuestionText(boardContext = [], focusToolId = null, focusQuestionId = "") {
+  const currentTool = boardContext.find((entry) => entry.toolId === focusToolId);
+  const currentQuestion = (currentTool?.questions ?? []).find(
+    (entry) => entry.qId === focusQuestionId
+  );
+  return extractQuestionNotes(currentQuestion).join(" ").trim();
+}
+
+async function detectSuggestionLanguageWithModel(
+  boardContext = [],
+  focusToolId = null,
+  focusQuestionId = ""
+) {
+  const authoritativeLanguageSource = buildAuthoritativeLanguageSource(
+    boardContext,
+    focusToolId,
+    focusQuestionId
+  );
+  const currentQuestionText = authoritativeLanguageSource.facts.join("\n").trim();
+
+  if (!currentQuestionText) {
+    return "EN";
+  }
+  return detectLanguageWithModel(currentQuestionText, "EN");
+}
+
+function localizeDiagnosisCopy(lang = "EN") {
+  if (lang === "ZH") {
+    return {
+      weakFrameReason:
+        "这个环节仍然缺少内容，建议你优先补齐它，让后续路径保持连贯。",
+      keyNodeReason: "建议你先完善这个关键节点，再继续后续内容。",
+      orderedReason: "建议你继续按当前顺序推进，并优先补齐最早出现的薄弱环节。",
+      interventionTool3:
+        "建议你：现在可以继续当前内容，不过如果稍微回看 Tool 3，把客户、需求和机会说清楚，后面的方案会更稳。",
+      interventionTool5:
+        "建议你：在规划验证和财务之前，如果能回访 Tool 5 补充价值主张和收入逻辑，整个商业模式会更闭环。",
+      emptyBoard:
+        "建议你先在白板上创建 Frame 并填写内容，再进行 Project Review。",
+      followOrder: "建议你继续按照 ToolBoard 顺序补齐下一步内容。",
+      auditPrefix: "建议你检查逻辑一致性：",
+      auditHeading: "逻辑一致性建议",
+    };
+  }
+
+  if (lang === "ES") {
+    return {
+      weakFrameReason:
+        "Esta etapa sigue vacia; conviene completarla primero para mantener la continuidad del proceso.",
+      keyNodeReason:
+        "Conviene reforzar primero este nodo clave antes de seguir con el resto del contenido.",
+      orderedReason:
+        "Conviene seguir el orden actual y reforzar primero el punto debil que aparece antes en el recorrido.",
+      interventionTool3:
+        "Sugerencia: puedes continuar con el contenido actual, pero si vuelves un momento a Tool 3 y aclaras cliente, necesidad y oportunidad, la solucion posterior quedara mucho mas solida.",
+      interventionTool5:
+        "Sugerencia: antes de profundizar en validacion y finanzas, conviene volver a Tool 5 para reforzar la propuesta de valor y la logica de ingresos, de modo que el modelo de negocio quede mas cerrado.",
+      emptyBoard:
+        "Conviene crear primero los Frame en la pizarra y a帽adir contenido antes de ejecutar Project Review.",
+      followOrder:
+        "Conviene continuar el siguiente paso siguiendo el orden de ToolBoard.",
+      auditPrefix: "Sugerencia: revisa la coherencia logica:",
+      auditHeading: "Sugerencias de coherencia logica",
+    };
+  }
+
+  if (lang === "CA") {
+    return {
+      weakFrameReason:
+        "Aquest pas encara no te contingut. Convé completar-lo primer perquè la resta del recorregut mantingui coherencia.",
+      keyNodeReason:
+        "Convé reforçar primer aquest node clau abans de continuar amb la resta del contingut.",
+      orderedReason:
+        "Convé continuar seguint l'ordre actual i reforçar primer el punt feble que apareix abans en el recorregut.",
+      interventionTool3:
+        "Suggeriment: pots continuar amb el contingut actual, pero si tornes un moment a Tool 3 i aclareixes client, necessitat i oportunitat, la solucio posterior quedara molt mes solida.",
+      interventionTool5:
+        "Suggeriment: abans d'aprofundir en validacio i finances, convé tornar a Tool 5 per reforçar la proposta de valor i la logica d'ingressos, de manera que el model de negoci quedi mes tancat.",
+      emptyBoard:
+        "Convé crear primer els frames a la pissarra i afegir-hi contingut abans d'executar Project Review.",
+      followOrder:
+        "Convé continuar el pas següent seguint l'ordre de ToolBoard.",
+      auditPrefix: "Suggeriment: revisa la coherencia logica:",
+      auditHeading: "Suggeriments de coherencia logica",
+    };
+  }
+
+  return {
+    weakFrameReason:
+      "This step is still missing content. It is best to complete it first so the rest of the path stays coherent.",
+    keyNodeReason:
+      "It is best to strengthen this key node first before continuing with the rest of the content.",
+    orderedReason:
+      "It is best to continue in the current order and strengthen the earliest weak point first.",
+    interventionTool3:
+      "Suggestion: you can continue with the current content, but if you briefly revisit Tool 3 and clarify the client, need, and opportunity, the later solution work will be much more solid.",
+    interventionTool5:
+      "Suggestion: before going deeper into validation and finance, it is best to revisit Tool 5 to strengthen the value proposition and revenue logic so the business model closes the loop.",
+    emptyBoard:
+      "Please create the relevant Frames on the board and add content before running Project Review.",
+    followOrder:
+      "It is best to continue with the next step following the ToolBoard order.",
+    auditPrefix: "Suggestion: check the logical alignment:",
+    auditHeading: "Logical alignment suggestions",
+  };
+}
+
 function getToolStatsMap(summary) {
   return new Map(summary.toolStats.map((tool) => [tool.toolId, tool]));
 }
@@ -1669,7 +2975,8 @@ function firstAvailableFrame(boardContext = []) {
   return "TB_TOOL_1_Q1";
 }
 
-function findFirstWeakFrame(boardContext = []) {
+function findFirstWeakFrame(boardContext = [], lang = "EN") {
+  const copy = localizeDiagnosisCopy(lang);
   for (const tool of boardContext) {
     for (const question of tool.questions ?? []) {
       if ((question.notes ?? []).length === 0) {
@@ -1677,8 +2984,7 @@ function findFirstWeakFrame(boardContext = []) {
           toolId: tool.toolId,
           toolName: tool.toolName,
           frameTitle: question.anchorFrameTitle,
-          reason:
-            "这个环节仍然缺少内容，建议你优先补齐它，让后续路径保持连贯。",
+          reason: copy.weakFrameReason,
         };
       }
     }
@@ -1687,7 +2993,8 @@ function findFirstWeakFrame(boardContext = []) {
   return null;
 }
 
-function findFirstFrameForTool(boardContext = [], toolId) {
+function findFirstFrameForTool(boardContext = [], toolId, lang = "EN") {
+  const copy = localizeDiagnosisCopy(lang);
   const tool = boardContext.find((entry) => entry.toolId === toolId);
   if (!tool) {
     return null;
@@ -1705,11 +3012,12 @@ function findFirstFrameForTool(boardContext = [], toolId) {
     toolId: tool.toolId,
     toolName: tool.toolName,
     frameTitle: target.anchorFrameTitle,
-    reason: "建议你先完善这个关键节点，再继续后续内容。",
+    reason: copy.keyNodeReason,
   };
 }
 
-function buildDeterministicDiagnosis(boardContext, summary) {
+function buildDeterministicDiagnosis(boardContext, summary, lang = "EN") {
+  const copy = localizeDiagnosisCopy(lang);
   const tool3Completion = getToolCompletionPercent(summary, 3);
   const tool5Completion = getToolCompletionPercent(summary, 5);
   const startedTool4Plus = hasStartedToolRange(summary, 4, 9);
@@ -1718,33 +3026,33 @@ function buildDeterministicDiagnosis(boardContext, summary) {
   if (startedTool4Plus && tool3Completion < 30) {
     return {
       recommendedFocus:
-        findFirstFrameForTool(boardContext, 3) ?? findFirstWeakFrame(boardContext),
+        findFirstFrameForTool(boardContext, 3, lang) ??
+        findFirstWeakFrame(boardContext, lang),
       isIntervention: true,
-      coachMessage:
-        "建议你：现在可以继续当前内容，不过如果稍微回看 Tool 3，把客户、需求和机会说清楚，后面的方案会更稳。",
+      coachMessage: copy.interventionTool3,
     };
   }
 
   if (startedTool7To9 && tool5Completion < 30) {
     return {
       recommendedFocus:
-        findFirstFrameForTool(boardContext, 5) ?? findFirstWeakFrame(boardContext),
+        findFirstFrameForTool(boardContext, 5, lang) ??
+        findFirstWeakFrame(boardContext, lang),
       isIntervention: true,
-      coachMessage:
-        "建议你：在规划验证和财务之前，如果能回访 Tool 5 补充价值主张和收入逻辑，整个商业模式会更闭环。",
+      coachMessage: copy.interventionTool5,
     };
   }
 
   return {
     recommendedFocus:
-      findFirstWeakFrame(boardContext) ?? {
+      findFirstWeakFrame(boardContext, lang) ?? {
         toolId: summary.toolStats[0]?.toolId ?? null,
         toolName: summary.toolStats[0]?.toolName ?? "",
         frameTitle: firstAvailableFrame(boardContext),
-        reason: "建议你继续按当前顺序推进，并优先补齐最早出现的薄弱环节。",
+        reason: copy.orderedReason,
       },
     isIntervention: false,
-    coachMessage: "建议你继续按当前顺序推进，并优先补齐最早出现的薄弱环节。",
+    coachMessage: copy.orderedReason,
   };
 }
 
@@ -1770,39 +3078,58 @@ async function getRagContext(query, sourceFiles) {
     const text = await retrieveRelevantContext(query, sourceFiles);
     return { text, ragStatus: "online" };
   } catch (error) {
-    console.warn("RAG unavailable:", error.message);
+    logger.warn("RAG context is unavailable.", { error });
     return { text: "", ragStatus: "offline" };
   }
 }
 
 async function generateLogicAuditSuggestions(boardContext, summary, ragStatus) {
+  const lang = getBoardLanguage(boardContext);
+  return generateLogicAuditSuggestionsLocalized(boardContext, summary, ragStatus, lang);
+}
+async function generateLogicAuditSuggestionsLocalized(
+  boardContext,
+  summary,
+  ragStatus,
+  lang = "EN"
+) {
   const auditPairs = collectAuditPairs(boardContext);
+  const copy = localizeDiagnosisCopy(lang);
   const fallbackSuggestions = [];
 
   if (auditPairs.tool1 && auditPairs.tool4) {
     fallbackSuggestions.push(
-      `建议你检查逻辑一致性：你在 Tool 1 提到的“${auditPairs.tool1.slice(
-        0,
-        60
-      )}”与 Tool 4 的“${auditPairs.tool4.slice(0, 60)}”似乎可以更紧密地对齐。`
+      `${copy.auditPrefix} ${
+        lang === "ZH"
+          ? `你在 Tool 1 提到的“${auditPairs.tool1.slice(0, 60)}”与 Tool 4 的“${auditPairs.tool4.slice(0, 60)}”似乎可以更紧密地对齐。`
+          : lang === "ES"
+          ? `lo que escribiste en Tool 1, "${auditPairs.tool1.slice(0, 60)}", y lo que aparece en Tool 4, "${auditPairs.tool4.slice(0, 60)}", podria alinearse con mayor claridad.`
+          : `what you wrote in Tool 1, "${auditPairs.tool1.slice(0, 60)}", and what appears in Tool 4, "${auditPairs.tool4.slice(0, 60)}", could align more tightly.`
+      }`
     );
   }
 
   if (auditPairs.tool3 && auditPairs.tool5) {
     fallbackSuggestions.push(
-      `建议你检查逻辑一致性：你在 Tool 3 提到的“${auditPairs.tool3.slice(
-        0,
-        60
-      )}”与 Tool 5 的“${auditPairs.tool5.slice(0, 60)}”似乎可以更紧密地对齐。`
+      `${copy.auditPrefix} ${
+        lang === "ZH"
+          ? `你在 Tool 3 提到的“${auditPairs.tool3.slice(0, 60)}”与 Tool 5 的“${auditPairs.tool5.slice(0, 60)}”似乎可以更紧密地对齐。`
+          : lang === "ES"
+          ? `lo que escribiste en Tool 3, "${auditPairs.tool3.slice(0, 60)}", y lo que aparece en Tool 5, "${auditPairs.tool5.slice(0, 60)}", podria alinearse con mayor claridad.`
+          : `what you wrote in Tool 3, "${auditPairs.tool3.slice(0, 60)}", and what appears in Tool 5, "${auditPairs.tool5.slice(0, 60)}", could align more tightly.`
+      }`
     );
   }
 
   if (auditPairs.tool5 && auditPairs.tool4) {
     fallbackSuggestions.push(
-      `建议你检查逻辑一致性：你在 Tool 5 提到的“${auditPairs.tool5.slice(
-        0,
-        60
-      )}”与 Tool 4 的“${auditPairs.tool4.slice(0, 60)}”似乎可以更紧密地对齐。`
+      `${copy.auditPrefix} ${
+        lang === "ZH"
+          ? `你在 Tool 5 提到的“${auditPairs.tool5.slice(0, 60)}”与 Tool 4 的“${auditPairs.tool4.slice(0, 60)}”似乎可以更紧密地对齐。`
+          : lang === "ES"
+          ? `lo que escribiste en Tool 5, "${auditPairs.tool5.slice(0, 60)}", y lo que aparece en Tool 4, "${auditPairs.tool4.slice(0, 60)}", podria alinearse con mayor claridad.`
+          : `what you wrote in Tool 5, "${auditPairs.tool5.slice(0, 60)}", and what appears in Tool 4, "${auditPairs.tool4.slice(0, 60)}", could align more tightly.`
+      }`
     );
   }
 
@@ -1812,21 +3139,23 @@ async function generateLogicAuditSuggestions(boardContext, summary, ragStatus) {
   );
   const effectiveRagStatus =
     backgroundRag.ragStatus === "offline" ? "offline" : ragStatus;
+  const languageLabel =
+    lang === "ZH" ? "Chinese" : lang === "ES" ? "Spanish" : "English";
 
-  const systemPrompt = `你需要做 ToolBoard 语义对齐审计。
+  const systemPrompt = `You are running a ToolBoard semantic alignment audit.
+Check these relationships:
+1. Tool 1 vs Tool 4: does the solution respond to the defined pain point?
+2. Tool 3 vs Tool 5: does the value proposition match the identified market opportunity?
+3. Tool 5 vs Tool 4: does the revenue logic match the product features or cost structure?
 
-检查三组关系：
-1. T1 与 T4：解决方案是否回应了定义的痛点。
-2. T3 与 T5：价值主张是否匹配识别出的市场机会。
-3. T5 与 T4：收费逻辑是否与产品功能或成本结构匹配。
-
-输出要求：
-- 只返回 JSON
-- 格式必须是 { "logicAuditSuggestions": string[] }
-- 如果没有明显漂移，返回空数组
-- 必须使用“建议你检查逻辑一致性：”开头
-- 严禁使用“错误”“警告”
-- 必须引用你看到的具体内容片段`;
+Output rules:
+- Return JSON only.
+- Use the exact format: {"logicAuditSuggestions": string[]}
+- If there is no meaningful drift, return an empty array.
+- Each suggestion must begin with "${copy.auditPrefix}"
+- Do not use words equivalent to "error" or "warning".
+- Cite concrete fragments you can actually see.
+- Respond entirely in ${languageLabel}.`;
 
   const userPrompt = `Board summary:
 - score: ${summary.completionScore}
@@ -1849,7 +3178,7 @@ ${
     : ""
 }
 
-请只输出 logicAuditSuggestions。`;
+Return logicAuditSuggestions in ${languageLabel}.`;
 
   try {
     const completion = await createChatCompletionWithRetry({
@@ -1876,13 +3205,16 @@ ${
       ragStatus: effectiveRagStatus,
     };
   } catch (error) {
-    console.warn("Logic audit generation failed:", error.message);
+    logger.warn("Logic audit generation failed. Falling back to deterministic suggestions.", {
+      error,
+    });
     return {
       logicAuditSuggestions: fallbackSuggestions.slice(0, 3),
       ragStatus: "offline",
     };
   }
 }
+
 
 async function buildSuggestionPrompt(boardContext, focusToolId, focusQuestion) {
   const promptSections = [];
@@ -1946,6 +3278,67 @@ app.get("/", (req, res) => {
   res.json({ status: "ok", message: "Toolboard GPT Server running" });
 });
 
+app.post("/api/thread/sync", async (req, res) => {
+  try {
+    const rateLimit = checkRateLimit(req);
+    if (!rateLimit.allowed) {
+      res.set("Retry-After", String(rateLimit.retryAfterSeconds));
+      return res.status(429).json({
+        error: `Rate limit exceeded. Please retry in ${rateLimit.retryAfterSeconds} second(s).`,
+      });
+    }
+
+    const boardId = String(req.body?.boardId || DEFAULT_BOARD_ID);
+    const boardContext = Array.isArray(req.body?.boardContext) ? req.body.boardContext : [];
+    const toolId = Number.isFinite(Number(req.body?.toolId)) ? Number(req.body.toolId) : null;
+    const toolName = String(req.body?.toolName || "");
+    const toolDescription = String(req.body?.toolDescription || "");
+    const focusQuestion =
+      req.body?.focusQuestion && typeof req.body.focusQuestion === "object"
+        ? req.body.focusQuestion
+        : null;
+    const preferredLanguage = String(req.body?.preferredLanguage || "");
+    const eventType = String(req.body?.eventType || "preview");
+
+    const { assistantId, threadId, factsPayload } = await syncThreadMemory({
+      boardId,
+      boardContext,
+      toolId,
+      toolName,
+      toolDescription,
+      focusQuestion,
+      preferredLanguage,
+      eventType,
+    });
+
+    logger.info("Thread memory synchronized.", {
+      sections: [
+        { label: "Thread ID", value: threadId },
+        { label: "Board ID", value: boardId },
+        { label: "Event", value: eventType },
+        {
+          label: "New Facts",
+      value: shouldLog("debug") ? factsPayload : summarizeFactsPayload(factsPayload),
+          format: "json",
+        },
+      ],
+    });
+
+    res.json({
+      ok: true,
+      assistantId,
+      threadId,
+      ragStatus: "online",
+    });
+  } catch (error) {
+    logger.error("Thread sync request failed.", { error });
+    res.status(500).json({
+      error: error.message,
+      ragStatus: "offline",
+    });
+  }
+});
+
 app.post("/api/suggest", async (req, res) => {
   try {
     const rateLimit = checkRateLimit(req);
@@ -1958,7 +3351,15 @@ app.post("/api/suggest", async (req, res) => {
       });
     }
 
-    const { toolId, toolName, toolDescription, focusQuestion, boardContext } =
+    const {
+      boardId,
+      toolId,
+      toolName,
+      toolDescription,
+      focusQuestion,
+      preferredLanguage,
+      boardContext,
+    } =
       req.body;
 
     const allTools = Array.isArray(boardContext)
@@ -1966,97 +3367,82 @@ app.post("/api/suggest", async (req, res) => {
       : boardContext?.questions
       ? [{ toolId, toolName, questions: boardContext.questions }]
       : [];
-
-    const allNotes = allTools
-      .flatMap((tool) =>
-        (tool.questions ?? []).flatMap((question) => question.notes ?? [])
-      )
-      .filter(Boolean)
-      .join(" ");
-
-    const detectedLanguage = detectLanguageCode(allNotes);
-    const responseLanguage =
-      detectedLanguage === "ZH"
-        ? "Chinese"
-        : detectedLanguage === "ES"
-        ? "Spanish"
-        : "English";
-    const { prompt: fullContext, ragStatus } = await buildSuggestionPrompt(
+    const dominantLanguage = await detectSuggestionLanguageWithModel(
       allTools,
       toolId,
-      focusQuestion
+      focusQuestion?.qId || ""
     );
-
-    console.log("Suggest route prioritizing board facts before RAG context.", {
+    const factsPayload = buildIncrementalFactsPayload({
+      boardContext: allTools,
       toolId,
-      filledFrames: summarizeBoardContext(allTools).filledFrames,
-      ragStatus,
+      toolName,
+      toolDescription,
+      focusQuestion: focusQuestion || {},
+      preferredLanguage: String(preferredLanguage || ""),
+      dominantLanguageOverride: dominantLanguage || "EN",
     });
-
-    const systemPrompt = `You are an expert Toolboard GPT assistant specializing in entrepreneurship, innovation, and design thinking.
-
-You will receive:
-1. Methodology knowledge paired with the user's sticky-note content for each Toolboard tool.
-2. A focus question that the user needs help with.
-
-Your job is to:
-- Understand the user's progress across all tools.
-- Use both the knowledge base and the user's answers to generate suggestions.
-- Return 3 specific, actionable suggestions for the focus question.
-
-Language rule:
-- Detect the user's dominant language from the sticky notes.
-- Respond entirely in that same language.
-
-Return only valid JSON in this exact structure:
-{
-  "suggestions": [
-    { "id": "s1", "title": "...", "content": "..." },
-    { "id": "s2", "title": "...", "content": "..." },
-    { "id": "s3", "title": "...", "content": "..." }
-  ]
-}`;
-
-    const userPrompt = `Here is the complete Toolboard context:
-
-${fullContext}
-
-Focus question:
-- tool: ${toolName ?? ""}
-- question: ${focusQuestion?.label ?? ""}
-- frame: ${focusQuestion?.anchorFrameTitle ?? ""}
-${toolDescription ? `- toolDescription: ${toolDescription}` : ""}
-
-Respond entirely in ${responseLanguage}.
-Generate 3 concrete suggestions grounded in Toolboard methodology and in the user's existing board content.`;
-
-    const completion = await createChatCompletionWithRetry({
-      model: "gpt-4o",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
+    logger.info("Suggestion request is using direct language-locked generation.", {
+      sections: [
+        { label: "Current Tool", value: `${toolName} (#${toolId})` },
+        { label: "Target Question", value: focusQuestion?.label || "(empty)" },
+        {
+          label: "Authoritative User-Language Source",
+          value:
+            factsPayload.latestStickyFacts.length > 0
+              ? factsPayload.latestStickyFacts
+              : "(empty -> English default)",
+          format: Array.isArray(factsPayload.latestStickyFacts) ? "json" : undefined,
+        },
+        {
+          label: "New Facts",
+          value: shouldLog("debug") ? factsPayload : summarizeFactsPayload(factsPayload),
+          format: "json",
+        },
       ],
-      temperature: 0.7,
-      max_tokens: 1500,
     });
 
-    const raw = completion.choices[0]?.message?.content ?? "{}";
-    const parsed = parseJsonResponse(raw, null);
+    const { rawReply, parsed, targetLanguage } = await generateDirectSuggestions({
+      factsPayload,
+      toolName,
+      toolDescription,
+    });
+
+    logger.info("GPT returned targeted suggestions with explicit user-language locking.", {
+      sections: [
+        {
+          label: "Reply Language",
+          value: `${getLanguageLabel(targetLanguage)} (${targetLanguage})`,
+        },
+        {
+          label: "Assistant Suggestions",
+          value: parsed?.suggestions
+            ? formatSuggestionsList(parsed.suggestions)
+            : rawReply,
+        },
+        ...(shouldLog("debug")
+          ? [{ label: "Raw Assistant Reply", value: rawReply }]
+          : []),
+      ],
+    });
 
     if (!parsed) {
-      console.error("Failed to parse suggest response:", raw);
+      logger.error("Failed to parse assistant suggestion response.", {
+        sections: [{ label: "Raw Assistant Reply", value: rawReply }],
+      });
       return res.json({
-        suggestions: [{ id: "s1", title: "Response", content: raw }],
-        ragStatus,
+        suggestions: [{ id: "s1", title: "Response", content: rawReply }],
+        ragStatus: "online",
+        threadId: null,
       });
     }
 
     res.json({
       ...parsed,
-      ragStatus,
+      ragStatus: "online",
+      threadId: null,
     });
   } catch (error) {
-    console.error("Error in /api/suggest:", error);
+    logger.error("Suggestion request failed.", { error });
     res.status(500).json({
       error: error.message,
       suggestions: [],
@@ -2076,10 +3462,11 @@ app.post("/api/refine", async (req, res) => {
     }
 
     const text = String(req.body?.text || "");
-    const lang = String(req.body?.lang || "");
+    const requestedLang = String(req.body?.lang || "");
     const context = req.body?.context && typeof req.body.context === "object" ? req.body.context : {};
     const boardContext = Array.isArray(req.body?.boardContext) ? req.body.boardContext : [];
-    const audit = analyzeFormality(text, lang);
+    const resolvedLang = await detectLanguageWithModel(text, requestedLang || "EN");
+    const audit = analyzeFormality(text, resolvedLang);
     const fallbackCurrentContext =
       boardContext.length > 0 ? buildCurrentContextFromBoard(boardContext, context) : null;
     const effectiveCurrentContext =
@@ -2115,29 +3502,29 @@ app.post("/api/refine", async (req, res) => {
       });
     }
 
-    const rewritten = await rewriteFormalTextWithGlobalContext(
-      text,
-      audit.lang,
-      {
-        ...context,
-        currentContext: effectiveCurrentContext,
-      }
-    );
-    rememberGeneratedText(rewritten.rewrittenText);
-    const rewrittenAudit = analyzeFormality(rewritten.rewrittenText, audit.lang, {
-      isSystemRefined: true,
-      isVerified: true,
-      isSystemGenerated: true,
-    });
+      const rewritten = await rewriteFormalTextWithGlobalContext(
+        text,
+        resolvedLang,
+        {
+          ...context,
+          currentContext: effectiveCurrentContext,
+        }
+      );
+      rememberGeneratedText(rewritten.rewrittenText);
+      const rewrittenAudit = analyzeFormality(rewritten.rewrittenText, resolvedLang, {
+        isSystemRefined: true,
+        isVerified: true,
+        isSystemGenerated: true,
+      });
 
-    res.json({
-      lang: audit.lang,
-      rewrittenText: rewritten.rewrittenText,
+      res.json({
+        lang: resolvedLang,
+        rewrittenText: rewritten.rewrittenText,
       context: {
         ...buildRefinementContext(context),
         currentContext: effectiveCurrentContext,
       },
-      message: getLocalizedRefinementHint(audit.lang),
+        message: getLocalizedRefinementHint(resolvedLang),
       needsRefinement: audit.needsRefinement,
       tooShort: false,
       metrics: {
@@ -2156,7 +3543,7 @@ app.post("/api/refine", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Error in /api/refine:", error);
+    logger.error("Refinement request failed.", { error });
     res.status(500).json({ error: error.message });
   }
 });
@@ -2176,13 +3563,15 @@ app.post("/api/diagnose", async (req, res) => {
     const boardContext = Array.isArray(req.body?.boardContext)
       ? req.body.boardContext
       : [];
+    const lang = await detectBoardLanguageWithModel(boardContext);
+    const copy = localizeDiagnosisCopy(lang);
     const summary = summarizeBoardContext(boardContext);
     const defaultFocus =
-      findFirstWeakFrame(boardContext) ?? {
+      findFirstWeakFrame(boardContext, lang) ?? {
         toolId: summary.toolStats[0]?.toolId ?? null,
         toolName: summary.toolStats[0]?.toolName ?? "",
         frameTitle: firstAvailableFrame(boardContext),
-        reason: "建议你继续按照 ToolBoard 顺序补齐下一步内容。",
+        reason: copy.followOrder,
       };
 
     if (summary.filledFrames === 0) {
@@ -2195,16 +3584,18 @@ app.post("/api/diagnose", async (req, res) => {
           toolStats: summary.toolStats,
         },
         recommendedFocus: defaultFocus,
-        coachMessage: "建议你先在白板上创建 Frame 并填写内容，再进行全局诊断。",
+        coachMessage: copy.emptyBoard,
+        lang,
         ragStatus: "online",
       });
     }
 
-    const deterministicDiagnosis = buildDeterministicDiagnosis(boardContext, summary);
-    const auditResult = await generateLogicAuditSuggestions(
+    const deterministicDiagnosis = buildDeterministicDiagnosis(boardContext, summary, lang);
+    const auditResult = await generateLogicAuditSuggestionsLocalized(
       boardContext,
       summary,
-      "online"
+      "online",
+      lang
     );
     const cardAnalyses = await buildCardQualityAnalyses(boardContext);
     const qualityAlert =
@@ -2212,13 +3603,21 @@ app.post("/api/diagnose", async (req, res) => {
       (await buildQualityAlert(boardContext));
     const ragStatus = auditResult.ragStatus;
 
-    console.log("Diagnosis facts take priority over RAG context.", {
-      totalFrames: summary.totalFrames,
-      filledFrames: summary.filledFrames,
-      completionScore: summary.completionScore,
-      recommendedFocus: deterministicDiagnosis.recommendedFocus.frameTitle,
-      isIntervention: deterministicDiagnosis.isIntervention,
-      ragStatus,
+    logger.info("Diagnosis completed with board facts prioritized over RAG context.", {
+      sections: [
+        {
+          label: "Summary",
+          value: {
+            totalFrames: summary.totalFrames,
+            filledFrames: summary.filledFrames,
+            completionScore: summary.completionScore,
+            recommendedFocus: deterministicDiagnosis.recommendedFocus.frameTitle,
+            isIntervention: deterministicDiagnosis.isIntervention,
+            ragStatus,
+          },
+          format: "json",
+        },
+      ],
     });
 
     res.json({
@@ -2238,10 +3637,11 @@ app.post("/api/diagnose", async (req, res) => {
       isIntervention: deterministicDiagnosis.isIntervention,
       qualityAlert,
       cardAnalyses,
+      lang,
       ragStatus,
     });
   } catch (error) {
-    console.error("Error in /api/diagnose:", error);
+    logger.error("Diagnosis request failed.", { error });
     res.status(500).json({
       ...EMPTY_DIAGNOSIS,
       coachMessage: error.message,
@@ -2251,5 +3651,7 @@ app.post("/api/diagnose", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Toolboard GPT Server running at http://localhost:${PORT}`);
+  logger.info("Toolboard GPT server is running.", {
+    sections: [{ label: "URL", value: `http://localhost:${PORT}` }],
+  });
 });
