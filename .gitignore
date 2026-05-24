@@ -20,4 +20,7 @@ build/
 
 # IDE
 .vscode/
-.idea/
+.idea/.docx_review/
+*.log
+.docx_review/
+*.log
