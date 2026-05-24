@@ -160,6 +160,7 @@ function summarizeFactsPayload(factsPayload = {}) {
     latestFactCount: Array.isArray(factsPayload.latestStickyFacts)
       ? factsPayload.latestStickyFacts.length
       : 0,
+    targetSuggestionCount: factsPayload.suggestionCountPlan?.targetCount || 3,
     otherFrameCount: Array.isArray(factsPayload.otherFilledFrames)
       ? factsPayload.otherFilledFrames.length
       : 0,
@@ -2109,6 +2110,53 @@ function formatIncrementalFactsMessage(factsPayload, eventType = "analyse") {
   ].join("\n");
 }
 
+async function buildAnalyseRagContext({
+  toolId = null,
+  toolName = "",
+  toolDescription = "",
+  focusQuestion = {},
+  factsPayload = {},
+} = {}) {
+  const sourceFiles = TOOL_KNOWLEDGE_FILES[toolId] ?? [];
+  const queryParts = [
+    toolName,
+    toolDescription,
+    focusQuestion?.label || "",
+    ...(Array.isArray(factsPayload?.latestStickyFacts) ? factsPayload.latestStickyFacts : []),
+    ...(Array.isArray(factsPayload?.otherFilledFrames)
+      ? factsPayload.otherFilledFrames.map((entry) => entry.summary)
+      : []),
+  ].filter(Boolean);
+  const query = queryParts.join(" | ").trim();
+  const sections = [];
+
+  const [toolRag, backgroundRag] = await Promise.all([
+    query && sourceFiles.length > 0
+      ? getRagContext(query, sourceFiles)
+      : Promise.resolve({ text: "", ragStatus: "online" }),
+    getRagContext(
+      `${toolName} ${focusQuestion?.label || ""} Toolboard methodology`,
+      BACKGROUND_FILES
+    ),
+  ]);
+
+  let ragStatus = "online";
+  if (toolRag.ragStatus === "offline" || backgroundRag.ragStatus === "offline") {
+    ragStatus = "offline";
+  }
+  if (toolRag.text) {
+    sections.push(`[Tool methodology context]\n${toolRag.text}`);
+  }
+  if (backgroundRag.text) {
+    sections.push(`[Background methodology context]\n${backgroundRag.text}`);
+  }
+
+  return {
+    text: sections.join("\n\n"),
+    ragStatus,
+  };
+}
+
 async function extractLatestAssistantReply(threadId) {
   const messages = await openai.beta.threads.messages.list(threadId, {
     order: "desc",
@@ -2172,6 +2220,7 @@ async function generateDirectSuggestions({
   factsPayload,
   toolName = "",
   toolDescription = "",
+  ragContext = "",
 } = {}) {
   const targetLanguage = factsPayload?.dominantLanguage || "EN";
   const languageLabel = getLanguageLabel(targetLanguage);
@@ -2257,6 +2306,7 @@ Suggestion rules:
           )
           .join("\n")
       : "(empty)",
+    ...(ragContext ? ["", "Relevant methodology context (use as background knowledge only):", ragContext] : []),
     "",
     `Required response language: ${languageLabel} (${targetLanguage})`,
   ].join("\n");
@@ -2288,16 +2338,12 @@ Suggestion rules:
     }));
 
   if (!doSuggestionsMatchLanguage(parsed.suggestions, targetLanguage)) {
-    logger.warn("Suggestion language drift detected in direct suggestion mode. Realigning output.", {
+    logger.warn("Suggestion language drift detected (not realigning — prompt is authoritative).", {
       sections: [
         { label: "Expected Language", value: `${languageLabel} (${targetLanguage})` },
         { label: "Detected Output", value: formatSuggestionsList(parsed.suggestions) },
       ],
     });
-    const realigned = await realignSuggestionsToLanguage(parsed.suggestions, targetLanguage);
-    if (realigned?.suggestions && Array.isArray(realigned.suggestions)) {
-      parsed = realigned;
-    }
   }
 
   return {
@@ -2366,19 +2412,55 @@ async function generateAssistantSuggestionsFromThread({
   threadId,
   assistantId,
   factsPayload,
+  ragContext = "",
 }) {
   await ensureNoActiveRunOnThread(threadId);
 
   const targetLanguage = factsPayload?.dominantLanguage || "EN";
   const responseLanguage = getLanguageLabel(targetLanguage);
+  const suggestionCount = factsPayload?.suggestionCountPlan?.targetCount || 3;
   const currentStickyLanguageEvidence = Array.isArray(factsPayload?.latestStickyFacts)
     ? factsPayload.latestStickyFacts.join(" | ")
     : "";
+  const authoritativeLanguageEvidence = Array.isArray(
+    factsPayload?.authoritativeLanguageFacts
+  )
+    ? factsPayload.authoritativeLanguageFacts.join(" | ")
+    : "";
+  const ragContextBlock = ragContext
+    ? `Retrieved methodology context for this run:\n${ragContext}\n\n`
+    : "Retrieved methodology context for this run:\n(none)\n\n";
 
   const run = await openai.beta.threads.runs.createAndPoll(threadId, {
     assistant_id: assistantId,
     additional_instructions:
-      `Respond with only valid JSON in the form {"suggestions":[{"id":"s1","title":"...","content":"..."},{"id":"s2","title":"...","content":"..."},{"id":"s3","title":"...","content":"..."}]}. Use the thread memory plus the new facts for this run. The language of the user's current sticky-note answer is ${responseLanguage}. Every suggestion title and every suggestion content field must be written entirely in ${responseLanguage}. Base your reply language on the user's current sticky-note text, not on any previous thread language. Do not mix languages and do not default back to a previous thread language. Current sticky-note language evidence: ${currentStickyLanguageEvidence || "(empty)"}.`,
+      `Respond with only valid JSON in the form {"suggestions":[{"id":"s1","title":"...","content":"..."},{"id":"s2","title":"...","content":"..."}, ... ]}. Return exactly ${suggestionCount} suggestions.
+
+Use this priority order:
+1. Current Miro board facts for the selected question and board state.
+2. The current selected Tool and Question.
+3. Thread history summaries and previous interaction continuity.
+4. Retrieved methodology context from RAG as supportive background knowledge only.
+
+Never let RAG override the actual board facts. Use retrieved methodology context only as background knowledge. Do not invent facts that are not present on the board.
+
+Language rule:
+- The response language must follow the user's sticky notes for the current question.
+- If the current question has no user-written sticky notes, use the authoritative language evidence provided from previous user-written sticky notes.
+- Do not switch language because of previous thread messages.
+- Every suggestion title and content field must be written entirely in ${responseLanguage}.
+- Do not mix languages.
+
+Coverage rule:
+- Different suggestions should cover different sub-questions or dimensions whenever the target question contains multiple prompts.
+
+Authoritative language evidence:
+${authoritativeLanguageEvidence || "(empty)"}
+
+Current-question language evidence:
+${currentStickyLanguageEvidence || "(empty)"}
+
+${ragContextBlock}`,
     response_format: { type: "json_object" },
     temperature: 0.4,
   });
@@ -2419,6 +2501,17 @@ async function generateAssistantSuggestionsFromThread({
     if (realigned?.suggestions && Array.isArray(realigned.suggestions)) {
       parsed = realigned;
     }
+  }
+
+  if (parsed?.suggestions && Array.isArray(parsed.suggestions)) {
+    parsed.suggestions = parsed.suggestions
+      .filter((entry) => entry && (entry.title || entry.content || entry.text))
+      .slice(0, suggestionCount)
+      .map((entry, index) => ({
+        id: entry.id || `s${index + 1}`,
+        title: entry.title || `Suggestion ${index + 1}`,
+        content: entry.content || entry.text || "",
+      }));
   }
 
   return {
@@ -2861,6 +2954,10 @@ async function detectSuggestionLanguageWithModel(
     return "EN";
   }
   return detectLanguageWithModel(currentQuestionText, "EN");
+}
+
+function getBoardThreadId(boardId = DEFAULT_BOARD_ID) {
+  return ensureBoardThread(boardId);
 }
 
 function localizeDiagnosisCopy(lang = "EN") {
@@ -3367,80 +3464,100 @@ app.post("/api/suggest", async (req, res) => {
       : boardContext?.questions
       ? [{ toolId, toolName, questions: boardContext.questions }]
       : [];
-    const dominantLanguage = await detectSuggestionLanguageWithModel(
-      allTools,
-      toolId,
-      focusQuestion?.qId || ""
-    );
+
+    // 1. Build facts payload locally (no API call, fast)
     const factsPayload = buildIncrementalFactsPayload({
       boardContext: allTools,
       toolId,
       toolName,
       toolDescription,
-      focusQuestion: focusQuestion || {},
+      focusQuestion,
       preferredLanguage: String(preferredLanguage || ""),
-      dominantLanguageOverride: dominantLanguage || "EN",
     });
-    logger.info("Suggestion request is using direct language-locked generation.", {
+
+    // 2. Build RAG context (two ChromaDB calls run in parallel)
+    const ragContext = await buildAnalyseRagContext({
+      toolId,
+      toolName,
+      toolDescription,
+      focusQuestion: focusQuestion || {},
+      factsPayload,
+    });
+
+    logger.info("Suggestion request using direct completion with board facts and RAG context.", {
       sections: [
         { label: "Current Tool", value: `${toolName} (#${toolId})` },
         { label: "Target Question", value: focusQuestion?.label || "(empty)" },
         {
           label: "Authoritative User-Language Source",
           value:
-            factsPayload.latestStickyFacts.length > 0
-              ? factsPayload.latestStickyFacts
+            factsPayload.authoritativeLanguageFacts?.length > 0
+              ? factsPayload.authoritativeLanguageFacts
               : "(empty -> English default)",
-          format: Array.isArray(factsPayload.latestStickyFacts) ? "json" : undefined,
+          format: Array.isArray(factsPayload.authoritativeLanguageFacts) ? "json" : undefined,
+        },
+        { label: "RAG Status", value: ragContext.ragStatus },
+        {
+          label: "RAG Context",
+          value: shouldLog("debug") ? ragContext.text || "(empty)" : ragContext.text ? truncateFactText(ragContext.text, 500) : "(empty)",
         },
         {
-          label: "New Facts",
+          label: "Facts Payload",
           value: shouldLog("debug") ? factsPayload : summarizeFactsPayload(factsPayload),
           format: "json",
         },
       ],
     });
 
+    // 3. Generate suggestions via chat.completions.create (fast, ~2-4s)
     const { rawReply, parsed, targetLanguage } = await generateDirectSuggestions({
       factsPayload,
       toolName,
       toolDescription,
+      ragContext: ragContext.text,
     });
 
-    logger.info("GPT returned targeted suggestions with explicit user-language locking.", {
+    logger.info("Direct suggestions generated.", {
       sections: [
         {
           label: "Reply Language",
           value: `${getLanguageLabel(targetLanguage)} (${targetLanguage})`,
         },
         {
-          label: "Assistant Suggestions",
-          value: parsed?.suggestions
-            ? formatSuggestionsList(parsed.suggestions)
-            : rawReply,
+          label: "Suggestions",
+          value: parsed?.suggestions ? formatSuggestionsList(parsed.suggestions) : rawReply,
         },
-        ...(shouldLog("debug")
-          ? [{ label: "Raw Assistant Reply", value: rawReply }]
-          : []),
+        ...(shouldLog("debug") ? [{ label: "Raw Reply", value: rawReply }] : []),
       ],
     });
 
     if (!parsed) {
-      logger.error("Failed to parse assistant suggestion response.", {
-        sections: [{ label: "Raw Assistant Reply", value: rawReply }],
+      logger.error("Failed to parse direct suggestion response.", {
+        sections: [{ label: "Raw Reply", value: rawReply }],
       });
       return res.json({
         suggestions: [{ id: "s1", title: "Response", content: rawReply }],
-        ragStatus: "online",
-        threadId: null,
+        ragStatus: ragContext.ragStatus,
       });
     }
 
-    res.json({
-      ...parsed,
-      ragStatus: "online",
-      threadId: null,
+    // 4. Return to user immediately
+    res.json({ ...parsed, ragStatus: ragContext.ragStatus });
+
+    // 5. Background: sync thread for archiving (non-blocking, does not delay the response)
+    syncThreadMemory({
+      boardId: String(boardId || DEFAULT_BOARD_ID),
+      boardContext: allTools,
+      toolId,
+      toolName,
+      toolDescription,
+      focusQuestion,
+      preferredLanguage: String(preferredLanguage || ""),
+      eventType: "analyse",
+    }).catch((error) => {
+      logger.warn("Background thread sync for Analyse failed (non-critical).", { error });
     });
+
   } catch (error) {
     logger.error("Suggestion request failed.", { error });
     res.status(500).json({
@@ -3563,6 +3680,21 @@ app.post("/api/diagnose", async (req, res) => {
     const boardContext = Array.isArray(req.body?.boardContext)
       ? req.body.boardContext
       : [];
+    const boardId = String(req.body?.boardId || DEFAULT_BOARD_ID);
+    const { threadId } = await syncThreadMemory({
+      boardId,
+      boardContext,
+      toolId: null,
+      toolName: "Project Review",
+      toolDescription: "Global board review and methodological continuity tracking.",
+      focusQuestion: {
+        qId: "PROJECT_REVIEW",
+        label: "Global project review",
+        anchorFrameTitle: "PROJECT_REVIEW",
+      },
+      preferredLanguage: "",
+      eventType: "project-review",
+    });
     const lang = await detectBoardLanguageWithModel(boardContext);
     const copy = localizeDiagnosisCopy(lang);
     const summary = summarizeBoardContext(boardContext);
@@ -3605,6 +3737,7 @@ app.post("/api/diagnose", async (req, res) => {
 
     logger.info("Diagnosis completed with board facts prioritized over RAG context.", {
       sections: [
+        { label: "Thread ID", value: threadId },
         {
           label: "Summary",
           value: {
@@ -3638,6 +3771,7 @@ app.post("/api/diagnose", async (req, res) => {
       qualityAlert,
       cardAnalyses,
       lang,
+      threadId,
       ragStatus,
     });
   } catch (error) {

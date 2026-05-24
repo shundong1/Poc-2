@@ -1130,8 +1130,9 @@ async function applyRefinementToSticky(noteId, rewrittenText) {
 }
 
 async function refreshDiagnosisPanel() {
+  const boardId = await getCurrentBoardId();
   const boardData = await readFullBoard();
-  const response = await fetchJson("/api/diagnose", { boardContext: boardData });
+  const response = await fetchJson("/api/diagnose", { boardId, boardContext: boardData });
   renderDiagnosis(response);
   return response;
 }
@@ -1940,8 +1941,9 @@ async function handleProjectReview() {
   setStatus("Reading full board for diagnosis...", "neutral");
 
   try {
+    const boardId = await getCurrentBoardId();
     const boardData = await readFullBoard();
-    const payload = { boardContext: boardData };
+    const payload = { boardId, boardContext: boardData };
     console.log("Sending board context:", payload);
     const response = await fetchJson("/api/diagnose", payload);
     renderDiagnosis(response);
