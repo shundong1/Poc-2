@@ -1132,9 +1132,15 @@ async function applyRefinementToSticky(noteId, rewrittenText) {
 async function refreshDiagnosisPanel() {
   const boardId = await getCurrentBoardId();
   const boardData = await readFullBoard();
-  const response = await fetchJson("/api/diagnose", { boardId, boardContext: boardData });
-  renderDiagnosis(response);
-  return response;
+  const phase1 = await fetchJson("/api/diagnose", { boardId, boardContext: boardData });
+  renderDiagnosis(phase1);
+  const phase2 = await fetchJson("/api/diagnose/details", {
+    boardId,
+    boardContext: boardData,
+    lang: phase1.lang,
+  });
+  updateDiagnosisAiContent(phase2);
+  return { ...phase1, ...phase2 };
 }
 
 function buildRefinementContextPayload(analysis) {
@@ -1722,32 +1728,62 @@ function renderDiagnosis(result) {
     })
   );
 
-  if (
-    Array.isArray(result.logicAuditSuggestions) &&
-    result.logicAuditSuggestions.length > 0
-  ) {
-    panel.appendChild(
-      createElement("div", {
-        text: uiCopy.logicAuditHeading,
-        style: "font-size:11px;font-weight:bold;color:#7a4b00;margin-bottom:6px;",
-      })
-    );
+  // Phase 2 placeholders (filled by updateDiagnosisAiContent)
+  const auditPlaceholder = createElement("div", { id: "diagnosisAuditPlaceholder" });
+  auditPlaceholder.appendChild(
+    createElement("div", {
+      text: uiCopy.logicAuditHeading + " ...",
+      style: "font-size:11px;color:#a08060;margin-top:8px;margin-bottom:4px;",
+    })
+  );
+  panel.appendChild(auditPlaceholder);
 
-    const auditList = createElement("div", {
-      style: "display:flex;flex-direction:column;gap:6px;",
-    });
-    for (const suggestion of result.logicAuditSuggestions) {
-      auditList.appendChild(
+  const cardPlaceholder = createElement("div", { id: "diagnosisCardPlaceholder" });
+  cardPlaceholder.appendChild(
+    createElement("div", {
+      text: "Analyzing card quality...",
+      style: "font-size:11px;color:#a08060;margin-top:8px;",
+    })
+  );
+  panel.appendChild(cardPlaceholder);
+}
+
+function updateDiagnosisAiContent(phase2) {
+  const uiCopy = getDiagnosticsUiCopy(phase2.lang || "EN");
+
+  const auditPlaceholder = document.getElementById("diagnosisAuditPlaceholder");
+  if (auditPlaceholder) {
+    auditPlaceholder.innerHTML = "";
+    const suggestions = Array.isArray(phase2.logicAuditSuggestions)
+      ? phase2.logicAuditSuggestions
+      : [];
+    if (suggestions.length > 0) {
+      auditPlaceholder.appendChild(
         createElement("div", {
-          text: suggestion,
-          style: "font-size:11px;line-height:1.5;color:#5c4a20;",
+          text: uiCopy.logicAuditHeading,
+          style: "font-size:11px;font-weight:bold;color:#7a4b00;margin-bottom:6px;",
         })
       );
+      const auditList = createElement("div", {
+        style: "display:flex;flex-direction:column;gap:6px;",
+      });
+      for (const suggestion of suggestions) {
+        auditList.appendChild(
+          createElement("div", {
+            text: suggestion,
+            style: "font-size:11px;line-height:1.5;color:#5c4a20;",
+          })
+        );
+      }
+      auditPlaceholder.appendChild(auditList);
     }
-    panel.appendChild(auditList);
   }
 
-  renderCardAnalyses(panel, result.cardAnalyses ?? []);
+  const cardPlaceholder = document.getElementById("diagnosisCardPlaceholder");
+  if (cardPlaceholder) {
+    cardPlaceholder.innerHTML = "";
+    renderCardAnalyses(cardPlaceholder, phase2.cardAnalyses ?? []);
+  }
 }
 
 async function insertStickyNote(text, frameTitle) {
@@ -1940,23 +1976,49 @@ async function handleProjectReview() {
   setLoadingState(true);
   setStatus("Reading full board for diagnosis...", "neutral");
 
+  let boardId, boardData;
   try {
-    const boardId = await getCurrentBoardId();
-    const boardData = await readFullBoard();
-    const payload = { boardId, boardContext: boardData };
-    console.log("Sending board context:", payload);
-    const response = await fetchJson("/api/diagnose", payload);
-    renderDiagnosis(response);
-    setStatus(
-      "Diagnosis complete.",
-      response.ragStatus === "offline" ? "warning" : "success"
-    );
+    boardId = await getCurrentBoardId();
+    boardData = await readFullBoard();
+  } catch (error) {
+    console.error(error);
+    setErrorMessage(error?.message || "Failed to read board.");
+    setLoadingState(false);
+    return;
+  }
+
+  // Phase 1: fast (score, progress, recommended focus ~2s)
+  let phase1;
+  try {
+    phase1 = await fetchJson("/api/diagnose", { boardId, boardContext: boardData });
+    renderDiagnosis(phase1);
   } catch (error) {
     console.error(error);
     hideDiagnosisPanel();
     setErrorMessage(error?.message || "Diagnosis failed.");
-  } finally {
     setLoadingState(false);
+    return;
+  }
+
+  setLoadingState(false);
+  setStatus("Analyzing board logic and card quality...", "neutral");
+
+  // Phase 2: AI analysis (logic audit + card rewrites, ~8-10s)
+  try {
+    const phase2 = await fetchJson("/api/diagnose/details", {
+      boardId,
+      boardContext: boardData,
+      lang: phase1.lang,
+    });
+    updateDiagnosisAiContent(phase2);
+    setStatus(
+      "Diagnosis complete.",
+      phase2.ragStatus === "offline" ? "warning" : "success"
+    );
+  } catch (error) {
+    console.error(error);
+    updateDiagnosisAiContent({ logicAuditSuggestions: [], cardAnalyses: [], lang: phase1.lang });
+    setStatus("AI analysis incomplete. Core diagnosis shown.", "warning");
   }
 }
 
