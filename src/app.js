@@ -1126,6 +1126,11 @@ async function applyRefinementToSticky(noteId, rewrittenText) {
     return;
   }
 
+  if (typeof miro.board.update === "function") {
+    await miro.board.update(sticky);
+    return;
+  }
+
   throw new Error("This Miro SDK version does not support sticky updates in the current code path.");
 }
 

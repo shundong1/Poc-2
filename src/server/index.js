@@ -1666,34 +1666,6 @@ export function analyzeFormality(text, lang = "", options = {}) {
   };
 }
 
-async function rewriteFormalText(text, lang = "") {
-  const detectedLang = detectLanguageCode(text, lang);
-  const promptLanguage =
-    detectedLang === "ZH" ? "涓枃" : detectedLang === "ES" ? "瑗跨彮鐗欒" : "English";
-
-  const completion = await createChatCompletionWithRetry({
-    model: "gpt-4o",
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a senior business advisor. Rewrite the following [Lang] text into a formal business statement with a high F-score, high lexical density, and strong syntactic structure. Preserve the core facts, remove conversational fillers such as 觉得, 好像, creo que, and I think, and return only the rewritten text.",
-      },
-      {
-        role: "user",
-        content: `[Lang: ${promptLanguage}]\n${text}`,
-      },
-    ],
-    temperature: 0.2,
-    max_tokens: 600,
-  });
-
-  return {
-    lang: detectedLang,
-    rewrittenText: (completion.choices[0]?.message?.content || "").trim(),
-  };
-}
-
 function getMethodologyGoal(toolId, toolTitle = "", questionDescription = "") {
   const defaults = {
     0: "clarify role boundaries, responsibilities, and collaboration rules within the team",
@@ -1743,52 +1715,6 @@ function buildRefinementContext(note = {}) {
     toolSpecificFocus:
       note.toolSpecificFocus || getToolRewriteFocus(note.toolId),
     frameTitle: note.frameTitle || "",
-  };
-}
-
-async function rewriteFormalTextWithContext(text, lang = "", context = {}) {
-  const detectedLang = detectLanguageCode(text, lang);
-  const promptLanguage =
-    detectedLang === "ZH" ? "Chinese" : detectedLang === "ES" ? "Spanish" : "English";
-  const safeContext = buildRefinementContext(context);
-  const currentContext = context.currentContext || {
-    toolContext: [],
-    projectContext: [],
-    targetQuestion: {
-      questionId: safeContext.questionId,
-      questionText: safeContext.questionDescription,
-      toolName: safeContext.toolTitle,
-    },
-  };
-
-  const completion = await createChatCompletionWithRetry({
-    model: "gpt-4o",
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a professional entrepreneurship mentor. Your task is to optimize a beginner-level idea written on a Miro sticky note.\n\nCurrent context:\n- The user is working in [{{toolTitle}}] during [{{questionDescription}}].\n- The core goal of this step is [{{methodologyGoal}}].\n- For this tool, the rewrite should especially [{{toolSpecificFocus}}].\n\nRewrite rules:\n- Reject superficial polishing. If the source text is sparse, do not merely swap synonyms.\n- Use logical placeholder guidance. Rewrite the note into a professional, structured statement.\n- When critical information is missing for this step, insert bracketed placeholders such as [target user segment], [evidence to validate], or [delivery constraint] so the user knows what to complete next.\n- Preserve the user's intent and keep the rewritten text relatively close in length.\n- Remove subjective fillers such as 鎴戣寰? 鎰熻, 濂藉儚, creo que, pienso que, I think, or I feel.\n- Return only the rewritten text in the same language as the source, with no preamble or explanation.",
-      },
-      {
-        role: "user",
-        content: `[Lang: ${promptLanguage}]
-[Tool Title: ${safeContext.toolTitle}]
-[Question Description: ${safeContext.questionDescription}]
-[Methodology Goal: ${safeContext.methodologyGoal}]
-[Tool-Specific Focus: ${safeContext.toolSpecificFocus}]
-[Frame: ${safeContext.frameTitle}]
-
-Original sticky text:
-${text}`,
-      },
-    ],
-    temperature: 0.2,
-    max_tokens: 600,
-  });
-
-  return {
-    lang: detectedLang,
-    rewrittenText: (completion.choices[0]?.message?.content || "").trim(),
   };
 }
 
@@ -2601,251 +2527,6 @@ function getRecentInteractionContext(boardId) {
   return lines.join("\n\n");
 }
 
-async function generateAssistantSuggestionsFromThread({
-  threadId,
-  assistantId,
-  factsPayload,
-  ragContext = "",
-}) {
-  await ensureNoActiveRunOnThread(threadId);
-
-  const targetLanguage = factsPayload?.dominantLanguage || "EN";
-  const responseLanguage = getLanguageLabel(targetLanguage);
-  const suggestionCount = factsPayload?.suggestionCountPlan?.targetCount || 3;
-  const currentStickyLanguageEvidence = Array.isArray(factsPayload?.latestStickyFacts)
-    ? factsPayload.latestStickyFacts.join(" | ")
-    : "";
-  const authoritativeLanguageEvidence = Array.isArray(
-    factsPayload?.authoritativeLanguageFacts
-  )
-    ? factsPayload.authoritativeLanguageFacts.join(" | ")
-    : "";
-  const ragContextBlock = ragContext
-    ? `Retrieved methodology context for this run:\n${ragContext}\n\n`
-    : "Retrieved methodology context for this run:\n(none)\n\n";
-
-  const run = await openai.beta.threads.runs.createAndPoll(threadId, {
-    assistant_id: assistantId,
-    additional_instructions:
-      `Respond with only valid JSON in the form {"suggestions":[{"id":"s1","title":"...","content":"..."},{"id":"s2","title":"...","content":"..."}, ... ]}. Return exactly ${suggestionCount} suggestions.
-
-Use this priority order:
-1. Current Miro board facts for the selected question and board state.
-2. The current selected Tool and Question.
-3. Thread history summaries and previous interaction continuity.
-4. Retrieved methodology context from RAG as supportive background knowledge only.
-
-Never let RAG override the actual board facts. Use retrieved methodology context only as background knowledge. Do not invent facts that are not present on the board.
-
-Language rule:
-- The response language must follow the user's sticky notes for the current question.
-- If the current question has no user-written sticky notes, use the authoritative language evidence provided from previous user-written sticky notes.
-- Do not switch language because of previous thread messages.
-- Every suggestion title and content field must be written entirely in ${responseLanguage}.
-- Do not mix languages.
-
-Coverage rule:
-- Different suggestions should cover different sub-questions or dimensions whenever the target question contains multiple prompts.
-
-Authoritative language evidence:
-${authoritativeLanguageEvidence || "(empty)"}
-
-Current-question language evidence:
-${currentStickyLanguageEvidence || "(empty)"}
-
-${ragContextBlock}`,
-    response_format: { type: "json_object" },
-    temperature: 0.4,
-  });
-
-  if (run.status !== "completed") {
-    logger.error("Assistant run failed before completion.", {
-      sections: [
-        { label: "Thread ID", value: threadId },
-        { label: "Run ID", value: run.id },
-        { label: "Run Status", value: run.status },
-        { label: "Last Error", value: run.last_error || "(none)", format: "json" },
-        {
-          label: "Incomplete Details",
-          value: run.incomplete_details || "(none)",
-          format: "json",
-        },
-      ],
-    });
-    throw new Error(`Assistant run ended with status ${run.status}`);
-  }
-
-  const rawReply = await extractLatestAssistantReply(threadId);
-  let parsed = parseJsonResponse(rawReply, null);
-
-  if (
-    parsed?.suggestions &&
-    Array.isArray(parsed.suggestions) &&
-    !doSuggestionsMatchLanguage(parsed.suggestions, targetLanguage)
-  ) {
-    logger.warn("Assistant suggestions language drift detected. Realigning response language.", {
-      sections: [
-        { label: "Thread ID", value: threadId },
-        { label: "Run ID", value: run.id },
-        { label: "Target Language", value: targetLanguage },
-      ],
-    });
-    const realigned = await realignSuggestionsToLanguage(parsed.suggestions, targetLanguage);
-    if (realigned?.suggestions && Array.isArray(realigned.suggestions)) {
-      parsed = realigned;
-    }
-  }
-
-  if (parsed?.suggestions && Array.isArray(parsed.suggestions)) {
-    parsed.suggestions = parsed.suggestions
-      .filter((entry) => entry && (entry.title || entry.content || entry.text))
-      .slice(0, suggestionCount)
-      .map((entry, index) => ({
-        id: entry.id || `s${index + 1}`,
-        title: entry.title || `Suggestion ${index + 1}`,
-        content: entry.content || entry.text || "",
-      }));
-  }
-
-  return {
-    runId: run.id,
-    rawReply,
-    parsed,
-  };
-}
-
-async function buildQualityAlert(boardContext = []) {
-  const notes = flattenNotes(boardContext);
-  if (notes.length === 0) {
-    return null;
-  }
-
-  const scoredNotes = notes
-    .map((note) => ({
-      ...note,
-      audit: analyzeFormality(note.text, "", {
-        isSystemRefined: note.refinedByAgent,
-        isVerified: note.verified,
-        isSystemGenerated: note.isSystemGenerated,
-      }),
-    }))
-    .sort((left, right) => left.audit.overallScore - right.audit.overallScore);
-
-  const substantiveNotes = scoredNotes.filter((entry) => !entry.audit.tooShort);
-  const shortNotes = scoredNotes.filter((entry) => entry.audit.tooShort);
-  const candidate =
-    substantiveNotes.find((entry) => entry.audit.needsRefinement) ||
-    substantiveNotes.find((entry) => entry.audit.level === "semi-formal") ||
-    (substantiveNotes.length === 0 ? shortNotes[0] : null);
-
-  logger.debug("Quality alert candidate selection.", {
-    sections: [
-      {
-        label: "Selection",
-        value: {
-          totalNotes: notes.length,
-          substantiveNotes: substantiveNotes.length,
-          shortNotes: shortNotes.length,
-          selectedText: candidate?.text || null,
-          selectedLevel: candidate?.audit?.level || null,
-          selectedTooShort: candidate?.audit?.tooShort || false,
-        },
-        format: "json",
-      },
-    ],
-  });
-
-  if (!candidate) {
-    return null;
-  }
-
-  if (candidate.audit.tooShort) {
-    const candidateContext = buildCurrentContextFromBoard(boardContext, candidate);
-    return {
-      noteId: candidate.noteId,
-      frameTitle: candidate.frameTitle,
-      toolName: candidate.toolName,
-      questionId: candidate.qId,
-      questionDescription: candidate.questionDescription,
-      methodologyGoal: candidate.methodologyGoal,
-      toolSpecificFocus: candidate.toolSpecificFocus,
-      currentContext: candidateContext,
-      lang: candidate.audit.lang,
-      sourceText: candidate.text,
-      rewrittenText: "",
-      canApply: false,
-      needsRefinement: false,
-      isTooShort: true,
-      message: getLocalizedShortMessage(candidate.audit.lang),
-      qualityMetrics: {
-        formalityScore: candidate.audit.formalityScore,
-        lexicalDensity: candidate.audit.lexicalDensity,
-        syntacticComplexity: candidate.audit.syntacticComplexity,
-        overallScore: candidate.audit.overallScore,
-      },
-    };
-  }
-
-  if (!candidate.audit.needsRefinement) {
-    const candidateContext = buildCurrentContextFromBoard(boardContext, candidate);
-    return {
-      noteId: candidate.noteId,
-      frameTitle: candidate.frameTitle,
-      toolName: candidate.toolName,
-      questionId: candidate.qId,
-      questionDescription: candidate.questionDescription,
-      methodologyGoal: candidate.methodologyGoal,
-      toolSpecificFocus: candidate.toolSpecificFocus,
-      currentContext: candidateContext,
-      lang: candidate.audit.lang,
-      sourceText: candidate.text,
-      rewrittenText: "",
-      canApply: false,
-      needsRefinement: false,
-      isTooShort: false,
-      message: candidate.audit.nextStepHint,
-      qualityMetrics: {
-        formalityScore: candidate.audit.formalityScore,
-        lexicalDensity: candidate.audit.lexicalDensity,
-        syntacticComplexity: candidate.audit.syntacticComplexity,
-        overallScore: candidate.audit.overallScore,
-      },
-    };
-  }
-
-  const candidateContext = buildCurrentContextFromBoard(boardContext, candidate);
-  const rewritten = await rewriteFormalTextWithGlobalContext(
-    candidate.text,
-    candidate.audit.lang,
-    {
-      ...buildRefinementContext(candidate),
-      currentContext: candidateContext,
-    }
-  );
-  return {
-    noteId: candidate.noteId,
-    frameTitle: candidate.frameTitle,
-    toolName: candidate.toolName,
-    questionId: candidate.qId,
-    questionDescription: candidate.questionDescription,
-    methodologyGoal: candidate.methodologyGoal,
-    toolSpecificFocus: candidate.toolSpecificFocus,
-    currentContext: candidateContext,
-    lang: candidate.audit.lang,
-    sourceText: candidate.text,
-    rewrittenText: rewritten.rewrittenText,
-    canApply: Boolean(candidate.noteId && rewritten.rewrittenText),
-    needsRefinement: true,
-    isTooShort: false,
-    message: getLocalizedRefinementHint(candidate.audit.lang),
-    qualityMetrics: {
-      formalityScore: candidate.audit.formalityScore,
-      lexicalDensity: candidate.audit.lexicalDensity,
-      syntacticComplexity: candidate.audit.syntacticComplexity,
-      overallScore: candidate.audit.overallScore,
-    },
-  };
-}
 
 function buildCardAlert(audit, lang) {
   if (audit.tooShort) {
@@ -2855,13 +2536,13 @@ function buildCardAlert(audit, lang) {
       message:
         lang === "ZH"
           ? "内容过于简略，导师暂时无法给出可靠的写作质量判断。"
-          : lang === "ES"
+          : lang === "ES" || lang === "CA"
           ? "Esta tarjeta es demasiado breve para sostener una revision fiable de calidad de escritura."
           : "This card is too brief to support a reliable writing-quality review.",
       reason:
         lang === "ZH"
           ? "当前文本缺少足够的事实信息，无法稳定评估正式度、词汇密度和句法结构。"
-          : lang === "ES"
+          : lang === "ES" || lang === "CA"
           ? "El texto todavia no contiene suficiente informacion concreta para evaluar con confianza la formalidad, la densidad lexical o la estructura sintactica."
           : "The text does not yet contain enough concrete information to evaluate formality, lexical density, or syntactic structure with confidence.",
     };
@@ -2874,13 +2555,13 @@ function buildCardAlert(audit, lang) {
       message:
         lang === "ZH"
           ? "建议：为了确保后续机会分析和商业洞察的生成质量，建议将该描述提升至更具正式性和信息密度的表达方式。"
-          : lang === "ES"
+          : lang === "ES" || lang === "CA"
           ? "Esta tarjeta carece de suficiente densidad informativa y expresion formal."
           : "This card lacks sufficient information density and formal expression.",
       reason:
         lang === "ZH"
           ? "这段表达仍然偏口语化，主观词较多，事实支撑和分析细节还不够充分。"
-          : lang === "ES"
+          : lang === "ES" || lang === "CA"
           ? "El texto usa formulaciones amplias o conversacionales y todavia no aporta suficiente detalle analitico para una interpretacion empresarial solida."
           : "The text uses broad or conversational phrasing and does not yet provide enough analytical detail for a strong business interpretation.",
     };
@@ -2893,13 +2574,13 @@ function buildCardAlert(audit, lang) {
       message:
         lang === "ZH"
           ? "表达尚可，但建议加入更多事实支撑。"
-          : lang === "ES"
+          : lang === "ES" || lang === "CA"
           ? "Esta tarjeta es comprensible, pero su tono empresarial puede reforzarse."
           : "This card is understandable, but its business tone can be strengthened.",
       reason:
         lang === "ZH"
           ? "文本已经包含一定信息，但还可以进一步增强正式表达与分析精度。"
-          : lang === "ES"
+          : lang === "ES" || lang === "CA"
           ? "El texto contiene hechos utiles, pero la redaccion puede ser mas formal y analiticamente precisa."
           : "The text contains useful facts, but the wording can become more formal and analytically precise.",
     };
@@ -2926,14 +2607,14 @@ async function runWithConcurrency(items, limit, asyncFn) {
   return results;
 }
 
-async function buildCardQualityAnalyses(boardContext = []) {
+async function buildCardQualityAnalyses(boardContext = [], boardLang = "") {
   const notes = flattenNotes(boardContext);
   if (notes.length === 0) {
     return [];
   }
 
   return runWithConcurrency(notes, 4, async (note, index) => {
-      const audit = analyzeFormality(note.text, "", {
+      const audit = analyzeFormality(note.text, boardLang, {
         isSystemRefined: note.refinedByAgent,
         isVerified: note.verified,
         isSystemGenerated: note.isSystemGenerated,
@@ -3082,14 +2763,6 @@ function summarizeBoardContext(boardContext = []) {
       totalFrames > 0 ? Math.round((filledFrames / totalFrames) * 100) : 0,
     toolStats,
   };
-}
-
-function getCurrentQuestionText(boardContext = [], focusToolId = null, focusQuestionId = "") {
-  const currentTool = boardContext.find((entry) => entry.toolId === focusToolId);
-  const currentQuestion = (currentTool?.questions ?? []).find(
-    (entry) => entry.qId === focusQuestionId
-  );
-  return extractQuestionNotes(currentQuestion).join(" ").trim();
 }
 
 function getBoardThreadId(boardId = DEFAULT_BOARD_ID) {
@@ -3316,10 +2989,6 @@ async function getRagContext(query, sourceFiles) {
   }
 }
 
-async function generateLogicAuditSuggestions(boardContext, summary, ragStatus) {
-  const lang = getBoardLanguage(boardContext);
-  return generateLogicAuditSuggestionsLocalized(boardContext, summary, ragStatus, lang);
-}
 async function generateLogicAuditSuggestionsLocalized(
   boardContext,
   summary,
@@ -3448,64 +3117,6 @@ Return logicAuditSuggestions in ${languageLabel}.`;
   }
 }
 
-
-async function buildSuggestionPrompt(boardContext, focusToolId, focusQuestion) {
-  const promptSections = [];
-  let ragStatus = "online";
-
-  for (const tool of boardContext) {
-    const notesText = (tool.questions ?? [])
-      .map((question) => {
-        const questionNotes =
-          question.notes && question.notes.length > 0
-            ? question.notes.map((note) => `    - ${note}`).join("\n")
-            : "    (empty)";
-
-        return `  [${question.anchorFrameTitle}] ${question.label}\n${questionNotes}`;
-      })
-      .join("\n\n");
-
-    let section = `=== ${tool.toolName} ===\n`;
-    const sourceFiles = TOOL_KNOWLEDGE_FILES[tool.toolId] ?? [];
-
-    if (sourceFiles.length > 0) {
-      const ragResult = await getRagContext(
-        `${tool.toolName} ${focusQuestion?.label ?? ""}`,
-        sourceFiles
-      );
-
-      if (ragResult.ragStatus === "offline") {
-        ragStatus = "offline";
-      } else if (ragResult.text) {
-        section += `\n[Knowledge Base for ${tool.toolName}]\n${ragResult.text}\n`;
-      }
-    }
-
-    section += `\n[User Board Content for ${tool.toolName}]\n${notesText}`;
-
-    if (tool.toolId === focusToolId) {
-      section += `\n\nThis is the current focus tool.`;
-    }
-
-    promptSections.push(section);
-  }
-
-  const backgroundRag = await getRagContext(
-    focusQuestion?.label ?? "Toolboard methodology entrepreneurship",
-    BACKGROUND_FILES
-  );
-
-  if (backgroundRag.ragStatus === "offline") {
-    ragStatus = "offline";
-  } else if (backgroundRag.text) {
-    promptSections.push(`=== Background Knowledge ===\n${backgroundRag.text}`);
-  }
-
-  return {
-    prompt: promptSections.join("\n\n---\n\n"),
-    ragStatus,
-  };
-}
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "Toolboard GPT Server running" });
@@ -3965,7 +3576,7 @@ app.post("/api/diagnose/details", async (req, res) => {
 
     const [auditResult, cardAnalyses] = await Promise.all([
       generateLogicAuditSuggestionsLocalized(boardContext, summary, "online", lang),
-      buildCardQualityAnalyses(boardContext),
+      buildCardQualityAnalyses(boardContext, lang),
     ]);
 
     const qualityAlert = buildQualityAlertFromCardAnalyses(cardAnalyses);

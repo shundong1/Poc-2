@@ -20,7 +20,11 @@ build/
 
 # IDE
 .vscode/
-.idea/.docx_review/
-*.log
+.idea/
+
+# Logs
 .docx_review/
-*.log
+.tmp_docx_check/
+
+# Runtime state (environment-specific, not for version control)
+src/server/assistant-memory.json
