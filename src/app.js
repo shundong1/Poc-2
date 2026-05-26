@@ -1,4 +1,4 @@
-import "./assets/style.css";
+﻿import "./assets/style.css";
 import { QUESTION_BANK } from "./questions.js";
 
 miro.board.ui.on("icon:click", async () => {
@@ -19,10 +19,81 @@ const RAG_STATUS_COLORS = {
 const refinedNoteIds = new Set();
 const verifiedNoteIds = new Set();
 const systemGeneratedNoteIds = new Set();
+const userVerifiedNoteIds = new Set();
 let showWelcome = true;
+let viewMode = "none";
+let cachedBoardId = null;
+let userVerifiedStateLoadedForBoardId = null;
+let isLoading = false;
 
 function normalizeTitle(value = "") {
   return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+async function getCurrentBoardId() {
+  if (cachedBoardId) {
+    return cachedBoardId;
+  }
+
+  try {
+    const boardInfo = await miro.board.getInfo();
+    cachedBoardId =
+      boardInfo?.id || boardInfo?.boardId || boardInfo?.board_id || "default-board";
+  } catch (error) {
+    console.warn("Failed to resolve board id, falling back to default-board.", error);
+    cachedBoardId = "default-board";
+  }
+
+  return cachedBoardId;
+}
+
+function getUserVerifiedStorageKey(boardId) {
+  return `toolboard-user-verified:${boardId || "default-board"}`;
+}
+
+function loadUserVerifiedNoteIds(boardId) {
+  try {
+    const raw = window.localStorage.getItem(getUserVerifiedStorageKey(boardId));
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+  } catch (error) {
+    console.warn("Failed to load user-verified note ids.", error);
+    return [];
+  }
+}
+
+function persistUserVerifiedNoteIds(boardId) {
+  try {
+    window.localStorage.setItem(
+      getUserVerifiedStorageKey(boardId),
+      JSON.stringify([...userVerifiedNoteIds])
+    );
+  } catch (error) {
+    console.warn("Failed to persist user-verified note ids.", error);
+  }
+}
+
+async function ensureUserVerifiedStateLoaded() {
+  const boardId = await getCurrentBoardId();
+  if (userVerifiedStateLoadedForBoardId === boardId) {
+    return boardId;
+  }
+
+  userVerifiedNoteIds.clear();
+  for (const noteId of loadUserVerifiedNoteIds(boardId)) {
+    userVerifiedNoteIds.add(noteId);
+    verifiedNoteIds.add(noteId);
+  }
+  userVerifiedStateLoadedForBoardId = boardId;
+  return boardId;
+}
+
+async function markNoteAsUserVerified(noteId) {
+  if (!noteId) return;
+  const boardId = await ensureUserVerifiedStateLoaded();
+  userVerifiedNoteIds.add(noteId);
+  verifiedNoteIds.add(noteId);
+  persistUserVerifiedNoteIds(boardId);
 }
 
 function extractPlainText(item) {
@@ -32,7 +103,7 @@ function extractPlainText(item) {
     .replace(/&nbsp;/g, " ")
     .replace(/&#39;/g, "'")
     .replace(/&#34;/g, '"')
-    .replace(/&#xff0c;/gi, "，")
+    .replace(/&#xff0c;/gi, ",")
     .replace(/&#x([0-9a-f]+);/gi, (_, hex) =>
       String.fromCodePoint(parseInt(hex, 16))
     )
@@ -51,7 +122,7 @@ function isTrivialArtifactText(text) {
     return true;
   }
 
-  if (compact.length <= 2 && /^[0-9O〇零○•·\-–—.,:;()]+$/i.test(compact)) {
+  if (compact.length <= 2 && /^[0-9O銆囬浂鈼嬧€⒙穃-鈥撯€?,:;()]+$/i.test(compact)) {
     return true;
   }
 
@@ -66,6 +137,7 @@ function buildMeaningfulNoteDetails(items, frameTitle) {
       widgetType: item.type || "sticky_note",
       refinedByAgent: refinedNoteIds.has(item.id),
       verified: verifiedNoteIds.has(item.id),
+      isUserVerified: userVerifiedNoteIds.has(item.id),
       isSystemGenerated: systemGeneratedNoteIds.has(item.id),
     }))
     .filter((entry) => {
@@ -113,6 +185,80 @@ function setStatus(message, tone = "neutral") {
   status.style.color = STATUS_COLORS[tone] ?? STATUS_COLORS.neutral;
 }
 
+function setErrorMessage(message) {
+  setStatus(message || "An unexpected error occurred.", "error");
+}
+
+function setLoadingState(nextValue) {
+  isLoading = nextValue === true;
+  ["btnPreview", "btnAnalyse", "btnDiagnose"].forEach((id) => {
+    const button = document.getElementById(id);
+    if (!button) return;
+    button.style.opacity = isLoading ? "0.72" : "1";
+    button.style.cursor = isLoading ? "progress" : "pointer";
+  });
+  console.log(`[Toolboard GPT] Loading state changed: ${isLoading ? "busy" : "idle"}`);
+}
+
+function resetActionUiState(nextMode = "none") {
+  setViewMode(nextMode);
+  hideDiagnosisPanel();
+  const suggestions = document.getElementById("suggestions");
+  if (suggestions) {
+    suggestions.innerHTML = "";
+  }
+  const previewContent = document.getElementById("boardPreviewContent");
+  if (previewContent) {
+    previewContent.textContent = "";
+  }
+  setStatus("", "neutral");
+}
+
+function setViewMode(nextMode = "none") {
+  viewMode = nextMode;
+  renderActiveView();
+}
+
+function renderActiveView() {
+  const contentView = document.getElementById("contentView");
+  const status = document.getElementById("status");
+  const preview = document.getElementById("boardPreview");
+  const suggestionSection = document.getElementById("suggestionSection");
+
+  if (!contentView || !status || !preview || !suggestionSection) {
+    return;
+  }
+
+  if (!contentView.contains(status)) {
+    contentView.appendChild(status);
+  }
+  if (!contentView.contains(preview)) {
+    contentView.appendChild(preview);
+  }
+  if (!contentView.contains(suggestionSection)) {
+    contentView.appendChild(suggestionSection);
+  }
+
+  preview.style.display = "none";
+  suggestionSection.style.display = "none";
+  status.style.display = "none";
+
+  switch (viewMode) {
+    case "preview":
+      status.style.display = "block";
+      preview.style.display = "block";
+      break;
+    case "analysis":
+      suggestionSection.style.display = "block";
+      status.style.display = "block";
+      break;
+    case "none":
+    default:
+      status.style.display = "block";
+      break;
+  }
+}
+
 function updateSystemStatus(ragStatus = "online") {
   const normalized = ragStatus === "offline" ? "offline" : "online";
   const dot = document.getElementById("ragStatusDot");
@@ -133,13 +279,13 @@ function createElement(tag, options = {}) {
 }
 
 function getQualityTitle(lang = "EN") {
-  if (lang === "ZH") return "逻辑质量预警";
+  if (lang === "ZH") return "閫昏緫璐ㄩ噺棰勮";
   if (lang === "ES") return "Alerta de calidad logica";
   return "Logic quality alert";
 }
 
 function getApplyLabel(lang = "EN") {
-  if (lang === "ZH") return "应用改写";
+  if (lang === "ZH") return "搴旂敤鏀瑰啓";
   if (lang === "ES") return "Aplicar reescritura";
   return "Apply rewrite";
 }
@@ -148,6 +294,122 @@ function getOptimizeCardLabel(lang = "EN") {
   if (lang === "ZH") return "Optimize this card";
   if (lang === "ES") return "Optimizar esta tarjeta";
   return "Optimize this card";
+}
+
+function getDiagnosticsUiCopy(lang = "EN") {
+  if (lang === "ZH") {
+    return {
+      alertTitle: "逻辑质量提醒",
+      problemLabel: "问题",
+      whyLabel: "原因",
+      originalTextLabel: "原始内容",
+      optimizedLabel: "建议优化",
+      progressLabel: "当前进度",
+      filledFramesLabel: "已填写",
+      framesSuffix: "个 Frame",
+      prioritizePathLabel: "建议优先调整路径",
+      prioritizeLogicLabel: "建议优先检查逻辑一致性",
+      nextStepButtonPrefix: "建议完善：",
+      nextStepSentencePrefix: "建议你下一步先处理",
+      logicAuditHeading: "逻辑一致性建议",
+      ignoreLabel: "忽略",
+      ignoreTitle: "内容已确认，不再提醒",
+    };
+  }
+
+  if (lang === "ES") {
+    return {
+      alertTitle: "Alerta de calidad logica",
+      problemLabel: "Problema",
+      whyLabel: "Motivo",
+      originalTextLabel: "Texto original",
+      optimizedLabel: "Optimizacion sugerida",
+      progressLabel: "Progreso actual",
+      filledFramesLabel: "Completados",
+      framesSuffix: "Frame",
+      prioritizePathLabel: "Conviene ajustar primero la ruta",
+      prioritizeLogicLabel: "Conviene revisar primero la coherencia logica",
+      nextStepButtonPrefix: "Conviene reforzar: ",
+      nextStepSentencePrefix: "Conviene trabajar ahora en",
+      logicAuditHeading: "Sugerencias de coherencia logica",
+      ignoreLabel: "Ignorar",
+      ignoreTitle: "Contenido confirmado; no volver a recordarlo",
+    };
+  }
+
+  if (lang === "CA") {
+    return {
+      alertTitle: "Alerta de qualitat logica",
+      problemLabel: "Problema",
+      whyLabel: "Motiu",
+      originalTextLabel: "Text original",
+      optimizedLabel: "Optimitzacio suggerida",
+      progressLabel: "Progrés actual",
+      filledFramesLabel: "Omplerts",
+      framesSuffix: "frames",
+      prioritizePathLabel: "Convé ajustar primer el cami",
+      prioritizeLogicLabel: "Convé revisar primer la coherencia logica",
+      nextStepButtonPrefix: "Convé reforçar: ",
+      nextStepSentencePrefix: "Convé treballar ara en",
+      logicAuditHeading: "Suggeriments de coherencia logica",
+      ignoreLabel: "Ignora",
+      ignoreTitle: "Contingut confirmat; no cal recordar-ho de nou",
+    };
+  }
+
+  return {
+    alertTitle: "Logic quality alert",
+    problemLabel: "Problem",
+    whyLabel: "Why",
+    originalTextLabel: "Original text",
+    optimizedLabel: "Suggested optimization",
+    progressLabel: "Current progress",
+    filledFramesLabel: "Filled",
+    framesSuffix: "frames",
+    prioritizePathLabel: "It is best to adjust the path first",
+    prioritizeLogicLabel: "It is best to check logical alignment first",
+    nextStepButtonPrefix: "Recommended focus: ",
+    nextStepSentencePrefix: "It is best to work next on",
+    logicAuditHeading: "Logical alignment suggestions",
+    ignoreLabel: "Ignore",
+    ignoreTitle: "Content confirmed; do not remind again",
+  };
+}
+
+function getPreviewUiCopy(lang = "EN") {
+  if (lang === "ZH") {
+    return {
+      title: "Board Preview",
+      tip: "💡 提示：如果这里缺少某些便签，请确认它们被直接放置在对应的问题区域内。位于指定 Frame 边界之外的便签无法被系统识别。",
+    };
+  }
+
+  if (lang === "ES") {
+    return {
+      title: "Vista previa del tablero",
+      tip: "💡 Consejo: si aqui faltan algunas notas adhesivas, asegurese de colocarlas directamente dentro del area correspondiente a la pregunta. Las notas fuera de los limites del frame designado no pueden ser detectadas por el sistema.",
+    };
+  }
+
+  if (lang === "CA") {
+    return {
+      title: "Vista previa del tauler",
+      tip: "💡 Consell: si aqui falten algunes notes adhesives, assegureu-vos que estiguin col·locades directament dins de l'area corresponent a la pregunta. Les notes situades fora dels limits del frame assignat no poden ser detectades pel sistema.",
+    };
+  }
+
+  return {
+    title: "Board Preview",
+    tip: "💡 Tip: If some sticky notes are missing here, please ensure they are placed directly inside the corresponding question area. Stickers outside the designated frame boundaries cannot be detected by the system.",
+  };
+}
+
+function updatePreviewCopy(lang = "EN") {
+  const uiCopy = getPreviewUiCopy(lang);
+  const title = document.getElementById("boardPreviewTitle");
+  const tip = document.getElementById("boardPreviewTip");
+  if (title) title.textContent = uiCopy.title;
+  if (tip) tip.textContent = uiCopy.tip;
 }
 
 function getNoIssueLabel(lang = "EN") {
@@ -387,7 +649,7 @@ function ensureUI() {
 
   const diagnoseButton = createElement("button", {
     id: "btnDiagnose",
-    text: "全局进度诊断",
+    text: "鍏ㄥ眬杩涘害璇婃柇",
     style:
       "width:100%;padding:10px 12px;margin-bottom:10px;cursor:pointer;background:#102a43;color:#fff;border:none;border-radius:10px;font-size:13px;font-weight:bold;",
   });
@@ -447,10 +709,12 @@ function ensureUI() {
   });
   previewWrap.append(
     createElement("div", {
+      id: "boardPreviewTitle",
       text: "Board Preview",
       style: "font-size:11px;font-weight:bold;margin-bottom:2px;",
     }),
     createElement("div", {
+      id: "boardPreviewTip",
       text: "💡 Tip: If some sticky notes are missing here, please ensure they are placed directly inside the corresponding question area. Stickers outside the designated frame boundaries cannot be detected by the system.",
       style:
         "font-size:12px;line-height:1.5;color:#666666;margin:8px 0;padding:8px 10px;border:1px solid #d9e8ff;border-radius:10px;background:#f5f9ff;",
@@ -483,6 +747,12 @@ function ensureUI() {
     })
   );
 
+  const contentView = createElement("div", {
+    id: "contentView",
+    style: "margin-top:4px;",
+  });
+  contentView.append(status, previewWrap, suggestionSection);
+
   mainView.append(
     header,
     systemBar,
@@ -490,14 +760,13 @@ function ensureUI() {
     toolBlock,
     questionBlock,
     buttonRow,
-    status,
-    previewWrap,
-    suggestionSection
+    contentView
   );
 
   root.append(welcomeView, mainView);
   document.body.appendChild(root);
   renderWelcomeState();
+  renderActiveView();
 }
 
 function populateToolOptions() {
@@ -596,6 +865,7 @@ function inspectFrameRead(frameTitle, frames, items) {
 }
 
 async function readFullBoard() {
+  await ensureUserVerifiedStateLoaded();
   const frames = await miro.board.get({ type: "frame" });
   const items = await miro.board.get({ type: ["sticky_note", "text"] });
   const results = [];
@@ -788,6 +1058,29 @@ async function zoomToFrame(frameTitle) {
   setStatus(`Moved to ${frameTitle}.`, "success");
 }
 
+async function resolveTargetFrame(frameTitle) {
+  const frames = await miro.board.get({ type: "frame" });
+  const exactMatches = frames.filter((entry) => entry.title === frameTitle);
+  const normalizedMatches = frames.filter(
+    (entry) => normalizeTitle(entry.title || "") === normalizeTitle(frameTitle)
+  );
+
+  const matches = exactMatches.length > 0 ? exactMatches : normalizedMatches;
+  const frame = matches[0] ?? null;
+
+  if (matches.length > 1) {
+    console.warn(
+      `[Toolboard GPT] Multiple frames matched "${frameTitle}". Using the first match: ${matches[0]?.id || "(unknown)"}`
+    );
+  }
+
+  return {
+    frame,
+    matchCount: matches.length,
+    matchedBy: exactMatches.length > 0 ? "exact" : normalizedMatches.length > 0 ? "normalized" : "missing",
+  };
+}
+
 async function fetchJson(path, payload) {
   const response = await fetch(`${BACKEND_URL}${path}`, {
     method: "POST",
@@ -833,14 +1126,26 @@ async function applyRefinementToSticky(noteId, rewrittenText) {
     return;
   }
 
+  if (typeof miro.board.update === "function") {
+    await miro.board.update(sticky);
+    return;
+  }
+
   throw new Error("This Miro SDK version does not support sticky updates in the current code path.");
 }
 
 async function refreshDiagnosisPanel() {
+  const boardId = await getCurrentBoardId();
   const boardData = await readFullBoard();
-  const response = await fetchJson("/api/diagnose", { boardContext: boardData });
-  renderDiagnosis(response);
-  return response;
+  const phase1 = await fetchJson("/api/diagnose", { boardId, boardContext: boardData });
+  renderDiagnosis(phase1);
+  const phase2 = await fetchJson("/api/diagnose/details", {
+    boardId,
+    boardContext: boardData,
+    lang: phase1.lang,
+  });
+  updateDiagnosisAiContent(phase2);
+  return { ...phase1, ...phase2 };
 }
 
 function buildRefinementContextPayload(analysis) {
@@ -863,6 +1168,105 @@ function extractQuestionNotes(question = {}) {
   return noteDetails
     .map((note) => String(note?.text || "").trim())
     .filter(Boolean);
+}
+
+function detectPreferredQuestionLanguage(boardData = [], toolId = null, qId = "") {
+  const detectFromText = (text = "") => {
+    const normalized = String(text || "").trim();
+    const lower = ` ${normalized.toLowerCase()} `;
+    const countHints = (source, hints) =>
+      hints.reduce((count, hint) => count + (source.includes(hint) ? 1 : 0), 0);
+    const catalanHints = [
+      " el ",
+      " la ",
+      " de ",
+      " per ",
+      " amb ",
+      " projecte ",
+      " mercat ",
+      " client ",
+      " proposta ",
+      " equip ",
+      " validacio ",
+      " estratègia ",
+      " estrategia ",
+      " valor ",
+      " usuaris ",
+      " servei ",
+      " aquest ",
+      " aquesta ",
+      " els ",
+      " les ",
+      " una ",
+      " un ",
+      " i ",
+      " que ",
+      " dels ",
+      " al ",
+      " pel ",
+      " com ",
+      " model de negoci ",
+      " proposta de valor ",
+      " però ",
+      " perque ",
+      " perquè ",
+    ];
+    const spanishHints = [
+      " el ",
+      " la ",
+      " de ",
+      " para ",
+      " con ",
+      " por ",
+      " los ",
+      " las ",
+      " una ",
+      " un ",
+      " y ",
+      " que ",
+      " del ",
+      " al ",
+      " como ",
+      " mercado ",
+      " cliente ",
+      " propuesta ",
+      " usuarios ",
+      " servicio ",
+      " modelo de negocio ",
+      " propuesta de valor ",
+    ];
+
+    if (/[\u4E00-\u9FFF]/.test(normalized)) return "ZH";
+    if (/[àèéíïòóúüç]/i.test(normalized) || countHints(lower, catalanHints) >= 2) return "CA";
+    if (/[áéíóúñü¿¡]/i.test(normalized) || countHints(lower, spanishHints) >= 2) return "ES";
+    return /[A-Za-z]/.test(normalized) ? "EN" : "";
+  };
+
+  const currentTool = boardData.find((entry) => entry.toolId === toolId);
+  const currentQuestion = (currentTool?.questions ?? []).find(
+    (entry) => entry.qId === qId
+  );
+  const currentQuestionText = extractQuestionNotes(currentQuestion).join(" ").trim();
+
+  const currentQuestionLang = detectFromText(currentQuestionText);
+  if (currentQuestionLang) return currentQuestionLang;
+
+  const currentToolText = (currentTool?.questions ?? [])
+    .flatMap((question) => extractQuestionNotes(question))
+    .join(" ")
+    .trim();
+
+  const currentToolLang = detectFromText(currentToolText);
+  if (currentToolLang) return currentToolLang;
+
+  const boardText = boardData
+    .flatMap((tool) => (tool.questions ?? []).flatMap((question) => extractQuestionNotes(question)))
+    .join(" ")
+    .trim();
+
+  const boardLang = detectFromText(boardText);
+  if (boardLang) return boardLang;
+  return "EN";
 }
 
 function buildCurrentContextPayload(boardData, analysis) {
@@ -937,7 +1341,25 @@ async function applyRefinement(refinementTarget) {
     systemGeneratedNoteIds.add(refinementTarget.noteId);
   }
   await refreshDiagnosisPanel();
-  setStatus("已优化，并已刷新当前审计结果。", "success");
+  setStatus("Refinement applied and the review has been refreshed.", "success");
+}
+
+async function ignoreCardAnalysis(analysis, cardElement) {
+  if (!analysis?.noteId) {
+    return;
+  }
+
+  await markNoteAsUserVerified(analysis.noteId);
+
+  if (cardElement) {
+    cardElement.style.transition = "opacity 180ms ease, background 180ms ease";
+    cardElement.style.background = "#eef8ef";
+    cardElement.style.borderColor = "#9ccc9c";
+    cardElement.style.opacity = "0.55";
+  }
+
+  setStatus("Confirmed. This item will not trigger reminders again.", "success");
+  await refreshDiagnosisPanel();
 }
 
 function renderSuggestions(suggestions, targetFrameTitle) {
@@ -982,6 +1404,16 @@ function renderSuggestions(suggestions, targetFrameTitle) {
     );
     wrap.appendChild(card);
   }
+}
+
+function renderSuggestionLoading(message = "Loading suggestions...") {
+  const wrap = document.getElementById("suggestions");
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <div style="border:1px solid #d9e4ff;border-radius:10px;padding:10px;background:#f7f9ff;color:#335; font-size:12px;line-height:1.5;">
+      ${message}
+    </div>
+  `;
 }
 
 function renderQualityAlert(panel, qualityAlert) {
@@ -1085,6 +1517,7 @@ function renderCardAnalyses(panel, cardAnalyses = []) {
   }
 
   for (const analysis of actionableAnalyses) {
+    const uiCopy = getDiagnosticsUiCopy(analysis.lang);
     const statusPresentation = getCardStatusPresentation(analysis);
     const hasIssue = Array.isArray(analysis.alerts) && analysis.alerts.length > 0;
     const primaryAlert = hasIssue ? analysis.alerts[0] : null;
@@ -1095,7 +1528,7 @@ function renderCardAnalyses(panel, cardAnalyses = []) {
 
     card.append(
       createElement("div", {
-        text: `${analysis.cardLabel}: ❌ Logic quality alert`,
+        text: `${analysis.cardLabel}: ${statusPresentation.icon} ${uiCopy.alertTitle}`,
         style: `font-size:12px;font-weight:bold;margin-bottom:6px;color:${
           "#c62828"
         };`,
@@ -1140,11 +1573,11 @@ function renderCardAnalyses(panel, cardAnalyses = []) {
     if (primaryAlert) {
       card.append(
         createElement("div", {
-          text: `Problem: ${primaryAlert.message}`,
+          text: `${uiCopy.problemLabel}: ${primaryAlert.message}`,
           style: "font-size:12px;line-height:1.6;color:#5c3c00;margin-bottom:6px;",
         }),
         createElement("div", {
-          text: `Why: ${primaryAlert.reason}`,
+          text: `${uiCopy.whyLabel}: ${primaryAlert.reason}`,
           style: "font-size:11px;line-height:1.6;color:#6d5b36;margin-bottom:8px;",
         })
       );
@@ -1152,7 +1585,7 @@ function renderCardAnalyses(panel, cardAnalyses = []) {
 
     card.append(
       createElement("div", {
-        text: "Original text",
+        text: uiCopy.originalTextLabel,
         style: "font-size:11px;font-weight:bold;color:#7a4b00;margin-bottom:4px;",
       }),
       createElement("div", {
@@ -1165,7 +1598,7 @@ function renderCardAnalyses(panel, cardAnalyses = []) {
     if (analysis.optimizedText) {
       card.append(
         createElement("div", {
-          text: "Suggested optimization",
+          text: uiCopy.optimizedLabel,
           style: "font-size:11px;font-weight:bold;color:#2f6b2f;margin-bottom:4px;",
         }),
         createElement("div", {
@@ -1177,6 +1610,9 @@ function renderCardAnalyses(panel, cardAnalyses = []) {
     }
 
     if (analysis.canOptimize) {
+      const actionRow = createElement("div", {
+        style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;",
+      });
       const optimizeButton = createElement("button", {
         text: getRefineButtonLabel(analysis.lang),
         style:
@@ -1190,7 +1626,44 @@ function renderCardAnalyses(panel, cardAnalyses = []) {
           setStatus(error?.message || "Failed to optimize this card.", "error");
         }
       });
-      card.appendChild(optimizeButton);
+      actionRow.appendChild(optimizeButton);
+
+      const ignoreButton = createElement("button", {
+        text: uiCopy.ignoreLabel,
+        title: uiCopy.ignoreTitle,
+        style:
+          "padding:7px 10px;cursor:pointer;background:#eef6f0;color:#2f6b3e;border:1px solid #b7d7c0;border-radius:8px;font-size:12px;",
+      });
+      ignoreButton.addEventListener("click", async () => {
+        try {
+          await ignoreCardAnalysis(analysis, card);
+        } catch (error) {
+          console.error(error);
+          setStatus(error?.message || "Failed to confirm this card.", "error");
+        }
+      });
+      actionRow.appendChild(ignoreButton);
+      card.appendChild(actionRow);
+    } else {
+      const actionRow = createElement("div", {
+        style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;",
+      });
+      const ignoreButton = createElement("button", {
+        text: uiCopy.ignoreLabel,
+        title: uiCopy.ignoreTitle,
+        style:
+          "padding:7px 10px;cursor:pointer;background:#eef6f0;color:#2f6b3e;border:1px solid #b7d7c0;border-radius:8px;font-size:12px;",
+      });
+      ignoreButton.addEventListener("click", async () => {
+        try {
+          await ignoreCardAnalysis(analysis, card);
+        } catch (error) {
+          console.error(error);
+          setStatus(error?.message || "Failed to confirm this card.", "error");
+        }
+      });
+      actionRow.appendChild(ignoreButton);
+      card.appendChild(actionRow);
     }
 
     panel.appendChild(card);
@@ -1198,6 +1671,7 @@ function renderCardAnalyses(panel, cardAnalyses = []) {
 }
 
 function renderDiagnosis(result) {
+  const uiCopy = getDiagnosticsUiCopy(result.lang || "EN");
   const panel = document.getElementById("diagnosisPanel");
   panel.style.display = "block";
   panel.innerHTML = "";
@@ -1214,7 +1688,9 @@ function renderDiagnosis(result) {
     });
     highlightCard.append(
       createElement("div", {
-        text: result.isIntervention ? "建议优先调整路径" : "建议优先检查逻辑一致性",
+        text: result.isIntervention
+          ? uiCopy.prioritizePathLabel
+          : uiCopy.prioritizeLogicLabel,
         style: "font-size:12px;font-weight:bold;color:#7a4b00;margin-bottom:6px;",
       }),
       createElement("div", {
@@ -1227,11 +1703,11 @@ function renderDiagnosis(result) {
 
   panel.append(
     createElement("div", {
-      text: `当前进度：${result.score}%`,
+      text: `${uiCopy.progressLabel}: ${result.score}%`,
       style: "font-size:16px;font-weight:bold;color:#7a4b00;margin-bottom:8px;",
     }),
     createElement("div", {
-      text: `已填写 ${result.progress?.filledFrames ?? 0} / ${result.progress?.totalFrames ?? 41} 个 Frame`,
+      text: `${uiCopy.filledFramesLabel} ${result.progress?.filledFrames ?? 0} / ${result.progress?.totalFrames ?? 41} ${uiCopy.framesSuffix}`,
       style: "font-size:11px;color:#6b5a2c;margin-bottom:8px;",
     }),
     createElement("div", {
@@ -1241,7 +1717,7 @@ function renderDiagnosis(result) {
   );
 
   const nextStepButton = createElement("button", {
-    text: `建议完善：${result.recommendedFocus?.toolName || "下一步"}`,
+    text: `${uiCopy.nextStepButtonPrefix}${result.recommendedFocus?.toolName || ""}`,
     style:
       "padding:7px 10px;margin-top:15px;margin-bottom:8px;cursor:pointer;background:#7a4b00;color:#fff;border:none;border-radius:8px;font-size:12px;",
   });
@@ -1252,58 +1728,135 @@ function renderDiagnosis(result) {
   panel.append(
     nextStepButton,
     createElement("div", {
-      text: `建议你下一步先处理 ${result.recommendedFocus?.frameTitle || ""}：${result.recommendedFocus?.reason || ""}`,
+      text: `${uiCopy.nextStepSentencePrefix} ${result.recommendedFocus?.frameTitle || ""}: ${result.recommendedFocus?.reason || ""}`,
       style: "font-size:12px;line-height:1.6;color:#4a3a18;margin-bottom:8px;",
     })
   );
 
-  if (
-    Array.isArray(result.logicAuditSuggestions) &&
-    result.logicAuditSuggestions.length > 0
-  ) {
-    panel.appendChild(
-      createElement("div", {
-        text: "逻辑一致性建议",
-        style: "font-size:11px;font-weight:bold;color:#7a4b00;margin-bottom:6px;",
-      })
-    );
+  // Phase 2 placeholders (filled by updateDiagnosisAiContent)
+  const auditPlaceholder = createElement("div", { id: "diagnosisAuditPlaceholder" });
+  auditPlaceholder.appendChild(
+    createElement("div", {
+      text: uiCopy.logicAuditHeading + " ...",
+      style: "font-size:11px;color:#a08060;margin-top:8px;margin-bottom:4px;",
+    })
+  );
+  panel.appendChild(auditPlaceholder);
 
-    const auditList = createElement("div", {
-      style: "display:flex;flex-direction:column;gap:6px;",
-    });
-    for (const suggestion of result.logicAuditSuggestions) {
-      auditList.appendChild(
+  const cardPlaceholder = createElement("div", { id: "diagnosisCardPlaceholder" });
+  cardPlaceholder.appendChild(
+    createElement("div", {
+      text: "Analyzing card quality...",
+      style: "font-size:11px;color:#a08060;margin-top:8px;",
+    })
+  );
+  panel.appendChild(cardPlaceholder);
+}
+
+function updateDiagnosisAiContent(phase2) {
+  const uiCopy = getDiagnosticsUiCopy(phase2.lang || "EN");
+
+  const auditPlaceholder = document.getElementById("diagnosisAuditPlaceholder");
+  if (auditPlaceholder) {
+    auditPlaceholder.innerHTML = "";
+    const suggestions = Array.isArray(phase2.logicAuditSuggestions)
+      ? phase2.logicAuditSuggestions
+      : [];
+    if (suggestions.length > 0) {
+      auditPlaceholder.appendChild(
         createElement("div", {
-          text: suggestion,
-          style: "font-size:11px;line-height:1.5;color:#5c4a20;",
+          text: uiCopy.logicAuditHeading,
+          style: "font-size:11px;font-weight:bold;color:#7a4b00;margin-bottom:6px;",
         })
       );
+      const auditList = createElement("div", {
+        style: "display:flex;flex-direction:column;gap:6px;",
+      });
+      for (const suggestion of suggestions) {
+        auditList.appendChild(
+          createElement("div", {
+            text: suggestion,
+            style: "font-size:11px;line-height:1.5;color:#5c4a20;",
+          })
+        );
+      }
+      auditPlaceholder.appendChild(auditList);
     }
-    panel.appendChild(auditList);
   }
 
-  renderCardAnalyses(panel, result.cardAnalyses ?? []);
+  const cardPlaceholder = document.getElementById("diagnosisCardPlaceholder");
+  if (cardPlaceholder) {
+    cardPlaceholder.innerHTML = "";
+    renderCardAnalyses(cardPlaceholder, phase2.cardAnalyses ?? []);
+  }
 }
 
 async function insertStickyNote(text, frameTitle) {
+  console.log("Action Triggered: handleInsert");
   setStatus("Inserting sticky note...", "neutral");
 
   try {
-    const frames = await miro.board.get({ type: "frame" });
-    const frame = frames.find((entry) => entry.title === frameTitle);
-    if (!frame) {
-      renderFrameWarning(frameTitle);
-      setStatus(`Frame "${frameTitle}" was not found.`, "warning");
+    console.log(`[Toolboard GPT] Attempting to insert into frame: ${frameTitle || "(empty)"}`);
+
+    if (!frameTitle) {
+      setStatus("The target frame was not found on the board. Please check whether the frame title has been changed.", "warning");
       return;
     }
 
+    const { frame, matchCount, matchedBy } = await resolveTargetFrame(frameTitle);
+    if (!frame) {
+      renderFrameWarning(frameTitle);
+      setStatus("The target frame was not found on the board. Please check whether the frame title has been changed.", "warning");
+      return;
+    }
+
+    console.log(
+      `[Toolboard GPT] Frame match resolved. matchedBy=${matchedBy}, matchCount=${matchCount}, frameId=${frame.id}`
+    );
+
     const items = await miro.board.get({ type: "sticky_note" });
-    const inside = items.filter((item) => item.parentId === frame.id);
-    const column = inside.length % 3;
-    const row = Math.floor(inside.length / 3);
-    const x = frame.x - frame.width / 2 + 40 + column * 250;
-    const y = frame.y - frame.height / 2 + 40 + row * 150;
-    const sticky = await miro.board.createStickyNote({ content: text, x, y });
+    const inside = items.filter(
+      (item) => item.parentId === frame.id || isItemInsideFrame(item, frame)
+    );
+    const stickyWidth = 220;
+    const horizontalGap = 32;
+    const verticalGap = 28;
+    const stickyHeight = 120;
+    const centerColumns = 3;
+    const column = inside.length % centerColumns;
+    const row = Math.floor(inside.length / centerColumns);
+    const columnOffset = (column - 1) * (stickyWidth + horizontalGap);
+    const rowOffset = row * (stickyHeight + verticalGap);
+    const x = frame.x + columnOffset;
+    const y = frame.y - 40 + rowOffset;
+
+    console.log(
+      `[Toolboard GPT] Creating sticky note at x=${x}, y=${y}, based on frame center x=${frame.x}, y=${frame.y}`
+    );
+
+    const sticky = await miro.board.createStickyNote({
+      content: text,
+      x,
+      y,
+      width: stickyWidth,
+    });
+
+    if (sticky) {
+      try {
+        if ("parentId" in sticky) {
+          sticky.parentId = frame.id;
+        }
+        if (typeof sticky.sync === "function") {
+          await sticky.sync();
+        }
+      } catch (attachError) {
+        console.warn(
+          `[Toolboard GPT] Sticky note was created but could not be attached to frame ${frame.id}. Falling back to geometric placement only.`,
+          attachError
+        );
+      }
+    }
+
     if (sticky?.id) {
       verifiedNoteIds.add(sticky.id);
       systemGeneratedNoteIds.add(sticky.id);
@@ -1311,8 +1864,166 @@ async function insertStickyNote(text, frameTitle) {
     await miro.board.viewport.zoomTo(sticky);
     setStatus(`Inserted into ${frameTitle}`, "success");
   } catch (error) {
+    console.error("[Toolboard GPT] Insert sticky note failed.", error);
+    setErrorMessage(
+      error?.message
+        ? `Insert failed: ${error.message}`
+        : "Insert failed. Please check the browser console.",
+    );
+  }
+}
+
+async function handlePreview() {
+  console.log("Action Triggered: handlePreview");
+  setLoadingState(false);
+  const previewContent = document.getElementById("boardPreviewContent");
+
+  resetActionUiState("preview");
+  setLoadingState(true);
+  setStatus("Loading preview...", "neutral");
+
+  try {
+    const toolSelect = document.getElementById("toolSelect");
+    const qSelect = document.getElementById("qSelect");
+    const boardData = await readFullBoard();
+    const preferredLanguage = detectPreferredQuestionLanguage(
+      boardData,
+      Number(toolSelect?.value),
+      qSelect?.value || ""
+    );
+    updatePreviewCopy(preferredLanguage || "EN");
+    previewContent.textContent = formatBoardPreview(boardData);
+    setStatus("Preview loaded.", "success");
+  } catch (error) {
     console.error(error);
-    setStatus("Insert failed. See console for details.", "error");
+    setViewMode("none");
+    setErrorMessage(error?.message || "Failed to read board.");
+  } finally {
+    setLoadingState(false);
+  }
+}
+
+async function handleAnalyse() {
+  console.log("Action Triggered: handleAnalyse");
+  setLoadingState(false);
+  resetActionUiState("analysis");
+  setSuggestionsVisible(true);
+  setLoadingState(true);
+  setStatus("Preparing analysis...", "neutral");
+  renderSuggestionLoading("Reading the board and preparing suggestions...");
+
+  try {
+    const toolSelect = document.getElementById("toolSelect");
+    const qSelect = document.getElementById("qSelect");
+    const toolId = Number(toolSelect.value);
+    const qId = qSelect.value;
+    const boardId = await getCurrentBoardId();
+    const tool = QUESTION_BANK.find((entry) => entry.toolId === toolId);
+    const question = tool?.questions.find((entry) => entry.qId === qId);
+    const boardData = await readFullBoard();
+    const missingFrames = collectMissingFrames(boardData);
+    const selectedTool = boardData.find((entry) => entry.toolId === toolId);
+    const selectedQuestion = selectedTool?.questions.find((entry) => entry.qId === qId);
+    const preferredLanguage = detectPreferredQuestionLanguage(
+      boardData,
+      toolId,
+      qId
+    );
+
+    if (!selectedQuestion?.found) {
+      renderFrameWarning(question?.anchorFrameTitle ?? "");
+      setStatus(
+        `Frame "${question?.anchorFrameTitle ?? ""}" was not found. Create it before requesting suggestions.`,
+        "warning"
+      );
+      return;
+    }
+
+    const payload = {
+      boardId,
+      mode: "single",
+      toolId,
+      toolName: tool?.toolName,
+      toolDescription: tool?.toolDescription,
+      focusQuestion: {
+        qId,
+        label: question?.label ?? "",
+        anchorFrameTitle: question?.anchorFrameTitle ?? "",
+      },
+      preferredLanguage,
+      boardContext: boardData,
+    };
+
+    setStatus("Requesting suggestions...", "neutral");
+    console.log("Sending board context:", payload);
+    const response = await fetchJson("/api/suggest", payload);
+    renderSuggestions(response.suggestions ?? [], question?.anchorFrameTitle ?? "");
+    setStatus(
+      missingFrames.length > 0
+        ? `${(response.suggestions ?? []).length} suggestion(s) generated. ${missingFrames.length} unrelated frame(s) are still missing from the board.`
+        : `${(response.suggestions ?? []).length} suggestion(s) generated.`,
+      missingFrames.length > 0 ? "warning" : "success"
+    );
+  } catch (error) {
+    console.error(error);
+    document.getElementById("suggestions").innerHTML = "";
+    setErrorMessage(error?.message || "Analysis failed.");
+  } finally {
+    setLoadingState(false);
+  }
+}
+
+async function handleProjectReview() {
+  console.log("Action Triggered: handleProjectReview");
+  setLoadingState(false);
+  resetActionUiState("analysis");
+  setSuggestionsVisible(true);
+  setLoadingState(true);
+  setStatus("Reading full board for diagnosis...", "neutral");
+
+  let boardId, boardData;
+  try {
+    boardId = await getCurrentBoardId();
+    boardData = await readFullBoard();
+  } catch (error) {
+    console.error(error);
+    setErrorMessage(error?.message || "Failed to read board.");
+    setLoadingState(false);
+    return;
+  }
+
+  // Phase 1: fast (score, progress, recommended focus ~2s)
+  let phase1;
+  try {
+    phase1 = await fetchJson("/api/diagnose", { boardId, boardContext: boardData });
+    renderDiagnosis(phase1);
+  } catch (error) {
+    console.error(error);
+    hideDiagnosisPanel();
+    setErrorMessage(error?.message || "Diagnosis failed.");
+    setLoadingState(false);
+    return;
+  }
+
+  setLoadingState(false);
+  setStatus("Analyzing board logic and card quality...", "neutral");
+
+  // Phase 2: AI analysis (logic audit + card rewrites, ~8-10s)
+  try {
+    const phase2 = await fetchJson("/api/diagnose/details", {
+      boardId,
+      boardContext: boardData,
+      lang: phase1.lang,
+    });
+    updateDiagnosisAiContent(phase2);
+    setStatus(
+      "Diagnosis complete.",
+      phase2.ragStatus === "offline" ? "warning" : "success"
+    );
+  } catch (error) {
+    console.error(error);
+    updateDiagnosisAiContent({ logicAuditSuggestions: [], cardAnalyses: [], lang: phase1.lang });
+    setStatus("AI analysis incomplete. Core diagnosis shown.", "warning");
   }
 }
 
@@ -1320,113 +2031,22 @@ function bindUI() {
   const toolSelect = document.getElementById("toolSelect");
   toolSelect.addEventListener("change", () => {
     populateQuestionOptions(Number(toolSelect.value));
+    resetActionUiState("none");
   });
 
-  document.getElementById("btnPreview").addEventListener("click", async () => {
-    const preview = document.getElementById("boardPreview");
-    const previewContent = document.getElementById("boardPreviewContent");
-
-    setStatus("Reading board...", "neutral");
-    preview.style.display = "none";
-    hideDiagnosisPanel();
-    setSuggestionsVisible(false);
-
-    try {
-      const boardData = await readFullBoard();
-      const missingFrames = collectMissingFrames(boardData);
-      previewContent.textContent = formatBoardPreview(boardData);
-      preview.style.display = "block";
-      setStatus(
-        missingFrames.length > 0
-          ? `Board read complete. ${missingFrames.length} frame(s) are missing from the board.`
-          : "Board read complete.",
-        missingFrames.length > 0 ? "warning" : "success"
-      );
-    } catch (error) {
-      console.error(error);
-      setStatus("Failed to read board.", "error");
-    }
+  document.getElementById("qSelect").addEventListener("change", () => {
+    resetActionUiState("none");
   });
 
-  document.getElementById("btnAnalyse").addEventListener("click", async () => {
-    setStatus("", "neutral");
-    hideDiagnosisPanel();
-    setSuggestionsVisible(true);
-    document.getElementById("suggestions").innerHTML = "";
-
-    try {
-      const toolId = Number(toolSelect.value);
-      const qId = document.getElementById("qSelect").value;
-      const tool = QUESTION_BANK.find((entry) => entry.toolId === toolId);
-      const question = tool?.questions.find((entry) => entry.qId === qId);
-      const boardData = await readFullBoard();
-      const missingFrames = collectMissingFrames(boardData);
-      const selectedTool = boardData.find((entry) => entry.toolId === toolId);
-      const selectedQuestion = selectedTool?.questions.find((entry) => entry.qId === qId);
-
-      if (!selectedQuestion?.found) {
-        renderFrameWarning(question?.anchorFrameTitle ?? "");
-        setStatus(
-          `Frame "${question?.anchorFrameTitle ?? ""}" was not found. Create it before requesting suggestions.`,
-          "warning"
-        );
-        return;
-      }
-
-      const payload = {
-        mode: "single",
-        toolId,
-        toolName: tool?.toolName,
-        toolDescription: tool?.toolDescription,
-        focusQuestion: {
-          qId,
-          label: question?.label ?? "",
-          anchorFrameTitle: question?.anchorFrameTitle ?? "",
-        },
-        boardContext: boardData,
-      };
-
-      setStatus("Requesting suggestions...", "neutral");
-      console.log("Sending board context:", payload);
-      const response = await fetchJson("/api/suggest", payload);
-      renderSuggestions(response.suggestions ?? [], question?.anchorFrameTitle ?? "");
-      setStatus(
-        missingFrames.length > 0
-          ? `${(response.suggestions ?? []).length} suggestion(s) generated. ${missingFrames.length} unrelated frame(s) are still missing from the board.`
-          : `${(response.suggestions ?? []).length} suggestion(s) generated.`,
-        missingFrames.length > 0 ? "warning" : "success"
-      );
-    } catch (error) {
-      console.error(error);
-      setStatus(error?.message || "Analysis failed.", "error");
-    }
-  });
-
-  document.getElementById("btnDiagnose").addEventListener("click", async () => {
-    setStatus("Reading full board for diagnosis...", "neutral");
-    setSuggestionsVisible(true);
-    document.getElementById("suggestions").innerHTML = "";
-
-    try {
-      const boardData = await readFullBoard();
-      const payload = { boardContext: boardData };
-      console.log("Sending board context:", payload);
-      const response = await fetchJson("/api/diagnose", payload);
-      renderDiagnosis(response);
-      setStatus(
-        "Diagnosis complete.",
-        response.ragStatus === "offline" ? "warning" : "success"
-      );
-    } catch (error) {
-      console.error(error);
-      hideDiagnosisPanel();
-      setStatus(error?.message || "Diagnosis failed.", "error");
-    }
-  });
+  document.getElementById("btnPreview").addEventListener("click", handlePreview);
+  document.getElementById("btnAnalyse").addEventListener("click", handleAnalyse);
+  document.getElementById("btnDiagnose").addEventListener("click", handleProjectReview);
 }
 
 ensureUI();
 populateToolOptions();
 populateQuestionOptions(QUESTION_BANK[0].toolId);
+updatePreviewCopy("EN");
 updateSystemStatus("online");
 bindUI();
+

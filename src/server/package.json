@@ -17,6 +17,7 @@
     "openai": "^4.57.0",
     "pdf-parse": "^2.4.5",
     "pdfjs-dist": "^5.4.624",
+    "toolboard-gpt-miro-plugin": "file:../..",
     "unpdf": "^1.4.0"
   }
 }

@@ -1,0 +1,49 @@
+{
+  "assistantId": "asst_WBUWzEtKmrmxRrhId8UGhCuF",
+  "boards": {
+    "uXjVGIM6aNM=": {
+      "threadId": "thread_LaM9E6RIUBNBh7khAVqwdhsw",
+      "updatedAt": "2026-05-24T22:24:35.049Z",
+      "recentInteractions": [
+        {
+          "timestamp": "2026-05-24T22:21:06.002Z",
+          "eventType": "analyse",
+          "toolId": 1,
+          "toolName": "Tool 1: Trial Mind Map",
+          "questionLabel": "Illustrative data: What data illustrates the problem or need? What is the size and scope of the issue? What indicators help explain the causes or effects it causes?",
+          "questionFrame": "TB_TOOL_1_Q1",
+          "userFacts": [
+            "Analyze the collected data to determine the size and scope of the problem. This includes identifying how many people are affected and the frequency of the issue to understand its impact."
+          ]
+        },
+        {
+          "timestamp": "2026-05-24T22:21:45.054Z",
+          "eventType": "project-review",
+          "toolId": null,
+          "toolName": "Project Review",
+          "questionLabel": "Global project review",
+          "questionFrame": "PROJECT_REVIEW",
+          "userFacts": []
+        },
+        {
+          "timestamp": "2026-05-24T22:24:33.966Z",
+          "eventType": "analyse",
+          "toolId": 1,
+          "toolName": "Tool 1: Trial Mind Map",
+          "questionLabel": "Trends: Is it a growing problem? What are the macro trends? What factors are likely to evolve the problem locally? What are the trends in the industry? What are the technological trends?",
+          "questionFrame": "TB_TOOL_1_Q3",
+          "userFacts": []
+        },
+        {
+          "timestamp": "2026-05-24T22:24:35.049Z",
+          "eventType": "project-review",
+          "toolId": null,
+          "toolName": "Project Review",
+          "questionLabel": "Global project review",
+          "questionFrame": "PROJECT_REVIEW",
+          "userFacts": []
+        }
+      ]
+    }
+  }
+}
